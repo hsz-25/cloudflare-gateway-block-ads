@@ -131,6 +131,7 @@ def api(method, path, data=None, retries=6, fatal=True):
             last_err = f"HTTP {e.code}: {resp_body}"
             if fatal:
                 die(f"API call failed: {method} {path} -> HTTP {e.code}\nResponse: {resp_body}")
+            log(f"Warning: non-fatal API call failed: {method} {path} -> HTTP {e.code}: {resp_body}")
             return None
         except Exception as e:  # network errors, timeouts, etc.
             last_err = str(e)
@@ -367,21 +368,50 @@ def main():
         f"{non_retired_count} active); {budget} of headroom before the {MAX_LISTS} cap "
         f"without touching retired lists.")
 
+    # Retired lists still referenced by Personal's *current* traffic can't be deleted
+    # until Personal is repointed away from them (Cloudflare rejects deleting a list
+    # that's in active use by a rule). Anything retired but already unreferenced is dead
+    # weight and safe to drop immediately regardless of budget.
+    personal_policy = next((r for r in current_policies if r["name"] == "Block ads - Personal"), None)
+    personal_traffic = personal_policy.get("traffic", "") if personal_policy else ""
+    referenced_retired = [l for l in retired_lists if f"${l['id']}" in personal_traffic]
+    orphaned_retired = [l for l in retired_lists if l not in referenced_retired]
+
+    if orphaned_retired:
+        log(f"Deleting {len(orphaned_retired)} retired lists that are already unreferenced...")
+        for l in orphaned_retired:
+            api("DELETE", f"/gateway/lists/{l['id']}", fatal=False)
+        budget = max(0, budget + len(orphaned_retired))
+        retired_lists = referenced_retired
+
     # Upper-bound estimate of brand new lists this run could need (ignores free space in
     # lists we're about to patch, so it's pessimistic - real usage is normally far lower).
     worst_case_new = (
         max(0, -(-len(normal_domains) // CHUNK_SIZE) - len(normal_lists))
         + max(0, -(-len(delta_domains) // CHUNK_SIZE) - len(delta_lists))
     )
-    if worst_case_new > budget and retired_lists:
+
+    if worst_case_new > budget and referenced_retired:
+        # Repoint Personal at just the Normal lists first - a real, valid, zero-downtime
+        # upgrade over the old OISD/Light setup on its own - which drops the reference to
+        # the remaining retired lists and frees those slots for deletion. Personal gets
+        # upgraded to the full Normal+Delta set a few steps later in this same run.
         log(f"Estimated worst case of {worst_case_new} new lists needed, only {budget} of "
-            f"headroom available. Deleting {len(retired_lists)} already-retired lists "
-            f"first to make room - Personal's policy will briefly reference an outgoing "
-            f"list set until it's repointed later in this same run.")
-        for l in retired_lists:
+            f"headroom available, and {len(referenced_retired)} retired lists are still "
+            f"referenced by Personal's current policy. Repointing Personal at the "
+            f"Normal-only list set first (a real upgrade on its own) to free them.")
+        upsert_policy("Block ads - Home", HOME_LOCATION_ID,
+                      [l["id"] for l in normal_lists], current_policies)
+        upsert_policy("Block ads - Personal", PERSONAL_LOCATION_ID,
+                      [l["id"] for l in normal_lists], current_policies)
+        for l in referenced_retired:
             api("DELETE", f"/gateway/lists/{l['id']}", fatal=False)
         budget = max(0, MAX_LISTS - non_retired_count)
         retired_lists = []  # already gone - nothing left to delete again at the end
+        # Refresh our view of "current" policies so the upsert_policy calls below see
+        # Home/Personal as already existing (PUT, not POST).
+        rules_resp = api("GET", "/gateway/rules")
+        current_policies = (rules_resp or {}).get("result") or current_policies
 
     normal_ids, normal_empty, normal_created, budget = sync_list_set(
         NORMAL_PREFIX, normal_domains, normal_lists, budget)
@@ -391,7 +421,8 @@ def main():
     upsert_policy("Block ads - Home", HOME_LOCATION_ID, normal_ids, current_policies)
     upsert_policy("Block ads - Personal", PERSONAL_LOCATION_ID, normal_ids + delta_ids, current_policies)
 
-    # Only now that no policy references them anymore: drop empty lists + retired lists.
+    # Only now that no policy references them anymore: drop empty lists + any leftover
+    # retired lists (normally already gone via the early-free step above).
     to_delete = normal_empty + delta_empty + [l["id"] for l in retired_lists]
     log(f"Deleting {len(to_delete)} superseded/empty lists...")
     for lid in to_delete:
