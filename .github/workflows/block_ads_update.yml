@@ -3,7 +3,7 @@ name: Block ads update
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 * * * *'
+    - cron: '0 4 * * *'
   push:
     branches:
       - '**'
@@ -15,16 +15,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install jq, curl and other utilities
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq curl coreutils
-
       - name: Run the script
         env:
           API_TOKEN: ${{ secrets.API_TOKEN }}
           ACCOUNT_ID: ${{ secrets.ACCOUNT_ID }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          chmod +x block_ads.sh
-          ./block_ads.sh
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_ACTOR_ID: ${{ github.actor_id }}
+        run: python3 block_ads.py
