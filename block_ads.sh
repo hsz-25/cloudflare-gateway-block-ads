@@ -26,18 +26,28 @@ function error() {
 # Small helper for authenticated Cloudflare API calls
 function api() {
     local method="$1" path="$2" data="${3:-}"
+    local url="https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}${path}"
+    local response http_code body
+
     if [[ -n "$data" ]]; then
-        curl -sSfL --retry "$MAX_RETRIES" --retry-all-errors -X "$method" \
-            "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}${path}" \
-            -H "Authorization: Bearer ${API_TOKEN}" -H "Content-Type: application/json" --data "$data"
+        response=$(curl -sSL --retry "$MAX_RETRIES" --retry-all-errors -X "$method" "$url" \
+            -H "Authorization: Bearer ${API_TOKEN}" -H "Content-Type: application/json" \
+            --data "$data" -w $'\n%{http_code}')
     else
-        # Do not send a Content-Type header on requests with no body (e.g. GET/DELETE) -
-        # Cloudflare's API returns 400 Bad Request if Content-Type: application/json is
-        # present without a matching JSON body.
-        curl -sSfL --retry "$MAX_RETRIES" --retry-all-errors -X "$method" \
-            "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}${path}" \
-            -H "Authorization: Bearer ${API_TOKEN}"
+        response=$(curl -sSL --retry "$MAX_RETRIES" --retry-all-errors -X "$method" "$url" \
+            -H "Authorization: Bearer ${API_TOKEN}" -w $'\n%{http_code}')
     fi
+
+    http_code=$(echo "$response" | tail -n1)
+    body=$(echo "$response" | sed '$d')
+
+    if [[ "$http_code" -lt 200 || "$http_code" -ge 300 ]]; then
+        echo "API call failed: ${method} ${path} -> HTTP ${http_code}" >&2
+        echo "Response body: ${body}" >&2
+        return 1
+    fi
+
+    echo "$body"
 }
 
 # --- Download the latest domain lists ---
