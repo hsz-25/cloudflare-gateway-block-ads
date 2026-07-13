@@ -67,11 +67,25 @@ HAGEZI_PRO_URL = "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/w
 
 NORMAL_PREFIX = "Block ads - Hagezi Normal"
 DELTA_PREFIX = "Block ads - Hagezi ProDelta"
-# Fully retired naming schemes from earlier iterations of this project - these are no
-# longer referenced by any policy once Personal is repointed, and get deleted outright.
-RETIRED_PREFIXES = ("Block ads - OISD",)
 
 STATE_FILE = "state.json"
+
+
+def is_retired(name):
+    """
+    True for lists from fully-retired naming schemes used by earlier iterations of this
+    project (plain OISD lists, and bare "Block ads - Hagezi <timestamp> - NNN" lists from
+    the original Hagezi-Light run, which predate the Normal/ProDelta split). These are
+    never referenced once Personal is repointed at the current Normal+Delta list IDs, so
+    they're safe to delete outright rather than diff/patch.
+    """
+    if name.startswith("Block ads - OISD"):
+        return True
+    if name.startswith(NORMAL_PREFIX) or name.startswith(DELTA_PREFIX):
+        return False
+    if name.startswith("Block ads - Hagezi "):
+        return True
+    return False
 
 
 def log(msg):
@@ -99,7 +113,15 @@ def api(method, path, data=None, retries=6, fatal=True):
         )
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read())
+                parsed = json.loads(resp.read())
+            # Cloudflare sometimes returns HTTP 200 with a logical failure in the body
+            # (e.g. rate limiting, transient validation errors) - "result" is null in
+            # that case, which would otherwise blow up callers that expect a list/dict.
+            if isinstance(parsed, dict) and parsed.get("success") is False:
+                last_err = f"HTTP 200 but success=false: {json.dumps(parsed.get('errors'))}"
+                time.sleep(min(2 ** attempt, 30))
+                continue
+            return parsed
         except urllib.error.HTTPError as e:
             resp_body = e.read().decode(errors="replace")
             if e.code == 429 or e.code >= 500:
@@ -320,20 +342,29 @@ def main():
         (l for l in current_lists if l["name"].startswith(DELTA_PREFIX)),
         key=lambda l: l["name"],
     )
-    retired_lists = [
-        l for l in current_lists
-        if any(l["name"].startswith(p) for p in RETIRED_PREFIXES)
-    ]
+    retired_lists = [l for l in current_lists if is_retired(l["name"])]
+    non_retired_count = len(current_lists) - len(retired_lists)
 
-    # Budget: total room left under the account cap for brand-new lists this run,
-    # ignoring lists we're about to retire (they'll be freed up by the time we're done,
-    # but we don't rely on that - the diff/patch approach barely creates new lists anyway).
-    already_used = len(current_lists)
-    budget = MAX_LISTS - already_used
-    if budget < 0:
-        budget = 0
-    log(f"Account currently has {already_used} lists; {budget} of new headroom before the "
-        f"{MAX_LISTS} cap (retired lists will free up {len(retired_lists)} more once dropped).")
+    budget = max(0, MAX_LISTS - non_retired_count)
+    log(f"Account currently has {len(current_lists)} lists ({len(retired_lists)} retired, "
+        f"{non_retired_count} active); {budget} of headroom before the {MAX_LISTS} cap "
+        f"without touching retired lists.")
+
+    # Upper-bound estimate of brand new lists this run could need (ignores free space in
+    # lists we're about to patch, so it's pessimistic - real usage is normally far lower).
+    worst_case_new = (
+        max(0, -(-len(normal_domains) // CHUNK_SIZE) - len(normal_lists))
+        + max(0, -(-len(delta_domains) // CHUNK_SIZE) - len(delta_lists))
+    )
+    if worst_case_new > budget and retired_lists:
+        log(f"Estimated worst case of {worst_case_new} new lists needed, only {budget} of "
+            f"headroom available. Deleting {len(retired_lists)} already-retired lists "
+            f"first to make room - Personal's policy will briefly reference an outgoing "
+            f"list set until it's repointed later in this same run.")
+        for l in retired_lists:
+            api("DELETE", f"/gateway/lists/{l['id']}", fatal=False)
+        budget = max(0, MAX_LISTS - non_retired_count)
+        retired_lists = []  # already gone - nothing left to delete again at the end
 
     normal_ids, normal_empty, normal_created, budget = sync_list_set(
         NORMAL_PREFIX, normal_domains, normal_lists, budget)
@@ -366,5 +397,37 @@ def main():
     log("Done.")
 
 
+def audit():
+    """Read-only inventory of the account's current Gateway lists/policies. Makes no changes."""
+    log("Fetching current Gateway policies...")
+    for r in api("GET", "/gateway/rules")["result"]:
+        n_lists = r["traffic"].count("any(dns.domains")
+        log(f"  policy {r['name']!r}: version {r['version']}, updated_at {r['updated_at']}, "
+            f"references {n_lists} list(s)")
+
+    log("Fetching current Gateway lists...")
+    current_lists = paginate("/gateway/lists")
+    by_bucket = {}
+    for l in current_lists:
+        if l["name"].startswith(NORMAL_PREFIX):
+            bucket = NORMAL_PREFIX
+        elif l["name"].startswith(DELTA_PREFIX):
+            bucket = DELTA_PREFIX
+        elif is_retired(l["name"]):
+            bucket = "retired"
+        else:
+            bucket = "other"
+        by_bucket.setdefault(bucket, []).append(l)
+
+    log(f"Total lists: {len(current_lists)} (cap {MAX_LISTS})")
+    for bucket, items in sorted(by_bucket.items()):
+        log(f"  {bucket}: {len(items)} lists")
+        for l in items[:3]:
+            log(f"    e.g. {l['name']!r} ({l['id']}, {l.get('count', '?')} items)")
+
+
 if __name__ == "__main__":
-    main()
+    if "--audit" in sys.argv:
+        audit()
+    else:
+        main()
