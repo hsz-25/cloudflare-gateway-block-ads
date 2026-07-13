@@ -2,11 +2,13 @@ name: Block ads update
 
 on:
   workflow_dispatch:
+    inputs:
+      audit:
+        description: 'Read-only inventory of current lists/policies (no changes)'
+        type: boolean
+        default: false
   schedule:
     - cron: '0 4 * * *'
-  push:
-    branches:
-      - '**'
 
 jobs:
   block_ads_update:
@@ -22,4 +24,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_ACTOR_ID: ${{ github.actor_id }}
-        run: python3 block_ads.py
+        run: |
+          if [ "${{ github.event.inputs.audit }}" = "true" ]; then
+            python3 block_ads.py --audit
+          else
+            python3 block_ads.py
+          fi
