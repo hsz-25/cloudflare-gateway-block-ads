@@ -285,8 +285,17 @@ def sync_list_set(prefix, target_domains, existing_lists, budget):
     return kept_ids, empty_ids, lists_created, budget
 
 
+# All 14 free-tier Security Threats subcategories (Anonymizer, Brand Embedding,
+# C2/Botnet, Compromised Domain, Cryptomining, DGA, DNS Tunneling, Malware, Phishing,
+# PUP, Private IP, Scam, Spam, Spyware). Folded into the same Home/Personal policy as
+# ad-blocking so there's one policy per location instead of a separate rule - matches
+# the old ControlD layout (one profile per location) and keeps precedence simple.
+SECURITY_CATEGORY_IDS = "178 80 176 187 83 175 117 131 188 134 191 151 153 68"
+
+
 def build_traffic(location_id, list_ids):
     clauses = " or ".join(f"any(dns.domains[*] in ${lid})" for lid in list_ids)
+    clauses += f" or any(dns.security_category[*] in {{{SECURITY_CATEGORY_IDS}}})"
     return f'dns.location in {{"{location_id}"}} and ({clauses})'
 
 
@@ -372,7 +381,7 @@ def main():
     # until Personal is repointed away from them (Cloudflare rejects deleting a list
     # that's in active use by a rule). Anything retired but already unreferenced is dead
     # weight and safe to drop immediately regardless of budget.
-    personal_policy = next((r for r in current_policies if r["name"] == "Block ads - Personal"), None)
+    personal_policy = next((r for r in current_policies if r["name"] == "Personal"), None)
     personal_traffic = personal_policy.get("traffic", "") if personal_policy else ""
     referenced_retired = [l for l in retired_lists if f"${l['id']}" in personal_traffic]
     orphaned_retired = [l for l in retired_lists if l not in referenced_retired]
@@ -400,9 +409,9 @@ def main():
             f"headroom available, and {len(referenced_retired)} retired lists are still "
             f"referenced by Personal's current policy. Repointing Personal at the "
             f"Normal-only list set first (a real upgrade on its own) to free them.")
-        upsert_policy("Block ads - Home", HOME_LOCATION_ID,
+        upsert_policy("Home", HOME_LOCATION_ID,
                       [l["id"] for l in normal_lists], current_policies)
-        upsert_policy("Block ads - Personal", PERSONAL_LOCATION_ID,
+        upsert_policy("Personal", PERSONAL_LOCATION_ID,
                       [l["id"] for l in normal_lists], current_policies)
         for l in referenced_retired:
             api("DELETE", f"/gateway/lists/{l['id']}", fatal=False)
@@ -418,8 +427,8 @@ def main():
     delta_ids, delta_empty, delta_created, budget = sync_list_set(
         DELTA_PREFIX, delta_domains, delta_lists, budget)
 
-    upsert_policy("Block ads - Home", HOME_LOCATION_ID, normal_ids, current_policies)
-    upsert_policy("Block ads - Personal", PERSONAL_LOCATION_ID, normal_ids + delta_ids, current_policies)
+    upsert_policy("Home", HOME_LOCATION_ID, normal_ids, current_policies)
+    upsert_policy("Personal", PERSONAL_LOCATION_ID, normal_ids + delta_ids, current_policies)
 
     # Only now that no policy references them anymore: drop empty lists + any leftover
     # retired lists (normally already gone via the early-free step above).
