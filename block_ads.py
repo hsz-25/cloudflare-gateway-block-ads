@@ -438,7 +438,13 @@ def main():
     result = subprocess.run(["git", "diff", "--staged", "--quiet"])
     if result.returncode != 0:
         git("commit", "-m", "Update sync state")
-        subprocess.run(["git", "push", "origin", "main"])
+        push = subprocess.run(["git", "push", "origin", "main"], capture_output=True, text=True)
+        if push.returncode != 0:
+            log(f"Warning: git push failed (state.json change-detection won't persist for "
+                f"next run, but the Cloudflare sync above already completed successfully): "
+                f"{push.stderr}")
+        else:
+            log("Pushed updated state.json.")
     else:
         log("Nothing to commit.")
 
