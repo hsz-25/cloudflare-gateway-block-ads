@@ -1,4 +1,5 @@
 #!/bin/bash
+# Home + Personal dual-source block script
 set -uo pipefail
 
 # Replace these variables with your actual Cloudflare API token and account ID
@@ -30,9 +31,12 @@ function api() {
             "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}${path}" \
             -H "Authorization: Bearer ${API_TOKEN}" -H "Content-Type: application/json" --data "$data"
     else
+        # Do not send a Content-Type header on requests with no body (e.g. GET/DELETE) -
+        # Cloudflare's API returns 400 Bad Request if Content-Type: application/json is
+        # present without a matching JSON body.
         curl -sSfL --retry "$MAX_RETRIES" --retry-all-errors -X "$method" \
             "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}${path}" \
-            -H "Authorization: Bearer ${API_TOKEN}" -H "Content-Type: application/json"
+            -H "Authorization: Bearer ${API_TOKEN}"
     fi
 }
 
