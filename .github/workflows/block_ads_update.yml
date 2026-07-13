@@ -10,6 +10,9 @@ on:
   schedule:
     - cron: '0 4 * * *'
 
+permissions:
+  contents: write
+
 jobs:
   block_ads_update:
     runs-on: ubuntu-latest
