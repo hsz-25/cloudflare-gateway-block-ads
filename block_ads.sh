@@ -2,18 +2,17 @@
 # Home + Personal dual-source block script
 #
 # Sources:
-#   - OISD small          (general ads/general blocking, low false-positive rate)
 #   - Hagezi Normal       (ads, affiliate, tracking, metrics, telemetry, phishing, malware...)
 #   - Hagezi Pro "delta"  (only the domains in Hagezi Pro that are NOT already in Hagezi
 #                          Normal - Pro is a superset of Normal, so we avoid paying for the
 #                          same domain twice across two Lists)
 #
 # Sharing:
-#   - The OISD and Hagezi Normal lists are created ONCE and referenced by BOTH the Home and
-#     Personal policies (Cloudflare Lists can be referenced by multiple rules).
+#   - The Hagezi Normal lists are created ONCE and referenced by BOTH the Home and Personal
+#     policies (Cloudflare Lists can be referenced by multiple rules).
 #   - The Hagezi Pro delta lists are referenced ONLY by the Personal policy, making Personal
-#     effectively equivalent to OISD + full Hagezi Pro, without ever creating duplicate lists
-#     for the domains Normal and Pro share.
+#     effectively equivalent to full Hagezi Pro, without ever creating duplicate lists for the
+#     domains Normal and Pro share.
 set -uo pipefail
 
 # Replace these variables with your actual Cloudflare API token and account ID
@@ -32,7 +31,7 @@ RUN_ID=$(date +%s)
 # Define error function
 function error() {
     echo "Error: $1"
-    rm -f oisd_small.txt.new hagezi_normal.txt.new hagezi_pro.txt.new hagezi_pro_delta.txt.new
+    rm -f hagezi_normal.txt.new hagezi_pro.txt.new hagezi_pro_delta.txt.new
     rm -f *.sorted *.chunk.* 2>/dev/null
     exit 1
 }
@@ -66,10 +65,6 @@ function api() {
 
 # --- Download the latest domain lists ---
 
-echo "Downloading OISD small..."
-curl -sSfL --retry "$MAX_RETRIES" --retry-all-errors "https://small.oisd.nl/domainswild2" | grep -vE '^\s*(#|$)' > oisd_small.txt.new || error "Failed to download the OISD list"
-[[ -s oisd_small.txt.new ]] || error "The OISD list is empty"
-
 echo "Downloading Hagezi Normal..."
 curl -sSfL --retry "$MAX_RETRIES" --retry-all-errors "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/multi-onlydomains.txt" | grep -vE '^\s*(#|$)' > hagezi_normal.txt.new || error "Failed to download the Hagezi Normal list"
 [[ -s hagezi_normal.txt.new ]] || error "The Hagezi Normal list is empty"
@@ -90,15 +85,12 @@ comm -23 hagezi_pro.txt.sorted hagezi_normal.txt.sorted > hagezi_pro_delta.txt.n
 
 # --- Sanity check against the account-wide list cap before creating anything ---
 
-oisd_lines=$(wc -l < oisd_small.txt.new)
 normal_lines=$(wc -l < hagezi_normal.txt.new)
 delta_lines=$(wc -l < hagezi_pro_delta.txt.new)
-oisd_lists_needed=$(( (oisd_lines + MAX_LIST_SIZE - 1) / MAX_LIST_SIZE ))
 normal_lists_needed=$(( (normal_lines + MAX_LIST_SIZE - 1) / MAX_LIST_SIZE ))
 delta_lists_needed=$(( (delta_lines + MAX_LIST_SIZE - 1) / MAX_LIST_SIZE ))
-total_needed=$(( oisd_lists_needed + normal_lists_needed + delta_lists_needed ))
+total_needed=$(( normal_lists_needed + delta_lists_needed ))
 
-echo "OISD small: ${oisd_lines} domains -> ${oisd_lists_needed} lists (shared by Home + Personal)"
 echo "Hagezi Normal: ${normal_lines} domains -> ${normal_lists_needed} lists (shared by Home + Personal)"
 echo "Hagezi Pro delta: ${delta_lines} domains -> ${delta_lists_needed} lists (Personal only)"
 echo "Total distinct lists needed: ${total_needed} (working limit: ${MAX_LISTS})"
@@ -137,10 +129,6 @@ function create_lists_for_source() {
     echo "${ids[@]}"
 }
 
-echo "Creating new OISD lists..."
-read -ra oisd_ids <<< "$(create_lists_for_source "Block ads - OISD" "oisd_small.txt.new")"
-echo "Created ${#oisd_ids[@]} OISD lists"
-
 echo "Creating new Hagezi Normal lists..."
 read -ra normal_ids <<< "$(create_lists_for_source "Block ads - Hagezi Normal" "hagezi_normal.txt.new")"
 echo "Created ${#normal_ids[@]} Hagezi Normal lists"
@@ -151,8 +139,8 @@ echo "Created ${#delta_ids[@]} Hagezi Pro delta lists"
 
 # --- Build and upsert the two location-scoped block policies ---
 
-# Home:     OISD + Hagezi Normal
-# Personal: OISD + Hagezi Normal + Hagezi Pro delta (== effectively full Hagezi Pro, dedup'd)
+# Home:     Hagezi Normal
+# Personal: Hagezi Normal + Hagezi Pro delta (== effectively full Hagezi Pro, dedup'd)
 
 function build_traffic() {
     local location_id="$1"; shift
@@ -191,8 +179,8 @@ function upsert_policy() {
     fi
 }
 
-upsert_policy "Block ads - Home" "$HOME_LOCATION_ID" "${oisd_ids[@]}" "${normal_ids[@]}"
-upsert_policy "Block ads - Personal" "$PERSONAL_LOCATION_ID" "${oisd_ids[@]}" "${normal_ids[@]}" "${delta_ids[@]}"
+upsert_policy "Block ads - Home" "$HOME_LOCATION_ID" "${normal_ids[@]}"
+upsert_policy "Block ads - Personal" "$PERSONAL_LOCATION_ID" "${normal_ids[@]}" "${delta_ids[@]}"
 
 # --- Clean up lists from the previous run, now that the policies point at the new ones ---
 
@@ -206,13 +194,12 @@ done <<< "$old_ids"
 
 # --- Commit the updated source files back to the repo ---
 
-mv oisd_small.txt.new oisd_small.txt
 mv hagezi_normal.txt.new hagezi_normal.txt
 mv hagezi_pro_delta.txt.new hagezi_pro_delta.txt
 rm -f hagezi_pro.txt.new *.sorted
 
 git config --global user.email "${GITHUB_ACTOR_ID}+${GITHUB_ACTOR}@users.noreply.github.com"
 git config --global user.name "$(gh api /users/${GITHUB_ACTOR} | jq .name -r)"
-git add oisd_small.txt hagezi_normal.txt hagezi_pro_delta.txt
+git add hagezi_normal.txt hagezi_pro_delta.txt
 git diff --staged --quiet || git commit -m "Update domain lists"
 git push origin main || echo "Nothing to push"
