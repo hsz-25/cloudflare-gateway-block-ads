@@ -285,17 +285,13 @@ def sync_list_set(prefix, target_domains, existing_lists, budget):
     return kept_ids, empty_ids, lists_created, budget
 
 
-# All 14 free-tier Security Threats subcategories (Anonymizer, Brand Embedding,
-# C2/Botnet, Compromised Domain, Cryptomining, DGA, DNS Tunneling, Malware, Phishing,
-# PUP, Private IP, Scam, Spam, Spyware). Folded into the same Home/Personal policy as
-# ad-blocking so there's one policy per location instead of a separate rule - matches
-# the old ControlD layout (one profile per location) and keeps precedence simple.
-SECURITY_CATEGORY_IDS = "178 80 176 187 83 175 117 131 188 134 191 151 153 68"
-
-
+# Security Threats category blocking is a SEPARATE Gateway rule ("Security Threats
+# Block (Home + Personal)"), managed by hand in the Cloudflare dashboard via its
+# category checkbox UI - deliberately NOT touched by this script. Keeping it out of
+# the ad-block traffic expression means it can be edited without ever hand-editing
+# wirefilter, and this script can never accidentally clobber it.
 def build_traffic(location_id, list_ids):
     clauses = " or ".join(f"any(dns.domains[*] in ${lid})" for lid in list_ids)
-    clauses += f" or any(dns.security_category[*] in {{{SECURITY_CATEGORY_IDS}}})"
     return f'dns.location in {{"{location_id}"}} and ({clauses})'
 
 
