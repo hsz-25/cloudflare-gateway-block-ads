@@ -357,7 +357,12 @@ def main():
     retired_lists = [l for l in current_lists if is_retired(l["name"])]
     non_retired_count = len(current_lists) - len(retired_lists)
 
-    budget = max(0, MAX_LISTS - non_retired_count)
+    # The 300-list cap is enforced on the account's TOTAL list count, regardless of
+    # whether a list is still referenced by a policy - a retired list still occupies a
+    # slot until it's actually deleted. So the real headroom for new creates, as long as
+    # we leave retired lists in place, is measured against the current total, not just
+    # the "active" subset.
+    budget = max(0, MAX_LISTS - len(current_lists))
     log(f"Account currently has {len(current_lists)} lists ({len(retired_lists)} retired, "
         f"{non_retired_count} active); {budget} of headroom before the {MAX_LISTS} cap "
         f"without touching retired lists.")
