@@ -147,7 +147,13 @@ def paginate(path, per_page=500):
     while True:
         sep = "&" if "?" in path else "?"
         resp = api("GET", f"{path}{sep}per_page={per_page}&page={page}")
-        batch = resp["result"]
+        batch = (resp or {}).get("result")
+        if batch is None:
+            # A well-formed 2xx response with a null/missing "result" (e.g. the resource
+            # was deleted between listing it and fetching it, or a transient API quirk) -
+            # treat as "nothing more here" rather than crashing the whole run.
+            log(f"Warning: {path} page {page} returned no result body, treating as empty/last page")
+            break
         results.extend(batch)
         # Cloudflare's result_info exposes total_count, not total_pages - stop once a
         # page comes back short (fewer than per_page items means it was the last page).
@@ -211,6 +217,7 @@ def sync_list_set(prefix, target_domains, existing_lists, budget):
     for lst in existing_lists:
         items = paginate(f"/gateway/lists/{lst['id']}/items")
         current_map[lst["id"]] = {i["value"] for i in items}
+        time.sleep(0.05)  # light throttle - avoid bursting hundreds of GETs at once
 
     all_current = set()
     for domains in current_map.values():
@@ -329,7 +336,12 @@ def main():
         return
 
     log("Fetching current Gateway policies...")
-    current_policies = api("GET", "/gateway/rules")["result"]
+    rules_resp = api("GET", "/gateway/rules")
+    current_policies = rules_resp.get("result") if rules_resp else None
+    if current_policies is None:
+        # Unlike list items, getting this wrong is dangerous: if we mistakenly think no
+        # policy exists, upsert_policy() would create a duplicate instead of updating.
+        die(f"Fetching current Gateway policies returned no result body: {rules_resp}")
 
     log("Fetching current Gateway lists...")
     current_lists = paginate("/gateway/lists")
@@ -400,7 +412,7 @@ def main():
 def audit():
     """Read-only inventory of the account's current Gateway lists/policies. Makes no changes."""
     log("Fetching current Gateway policies...")
-    for r in api("GET", "/gateway/rules")["result"]:
+    for r in (api("GET", "/gateway/rules") or {}).get("result") or []:
         n_lists = r["traffic"].count("any(dns.domains")
         log(f"  policy {r['name']!r}: version {r['version']}, updated_at {r['updated_at']}, "
             f"references {n_lists} list(s)")
