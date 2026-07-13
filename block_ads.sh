@@ -1,259 +1,167 @@
 #!/bin/bash
+set -uo pipefail
 
 # Replace these variables with your actual Cloudflare API token and account ID
 API_TOKEN="$API_TOKEN"
 ACCOUNT_ID="$ACCOUNT_ID"
-PREFIX="Block ads"
 MAX_LIST_SIZE=1000
 MAX_LISTS=100
 MAX_RETRIES=10
 
+# DNS Location IDs (Cloudflare Zero Trust > Networks > Resolvers & Proxies > DNS locations)
+HOME_LOCATION_ID="3d4d56f8749d41ea97d291ec5faf3de7"
+PERSONAL_LOCATION_ID="6b497a05ed454984b33cbf3554ca544b"
+
+RUN_ID=$(date +%s)
+
 # Define error function
 function error() {
     echo "Error: $1"
-    rm -f oisd_small_domainswild2.txt.*
+    rm -f oisd_small_domainswild2.txt.new hagezi_light_onlydomains.txt.new
+    rm -f *.chunk.* 2>/dev/null
     exit 1
 }
 
-# Define silent error function
-function silent_error() {
-    echo "Silent error: $1"
-    rm -f oisd_small_domainswild2.txt.*
-    exit 0
+# Small helper for authenticated Cloudflare API calls
+function api() {
+    local method="$1" path="$2" data="${3:-}"
+    if [[ -n "$data" ]]; then
+        curl -sSfL --retry "$MAX_RETRIES" --retry-all-errors -X "$method" \
+            "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}${path}" \
+            -H "Authorization: Bearer ${API_TOKEN}" -H "Content-Type: application/json" --data "$data"
+    else
+        curl -sSfL --retry "$MAX_RETRIES" --retry-all-errors -X "$method" \
+            "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}${path}" \
+            -H "Authorization: Bearer ${API_TOKEN}" -H "Content-Type: application/json"
+    fi
 }
 
-# Download the latest domains list
-curl -sSfL --retry "$MAX_RETRIES" --retry-all-errors https://small.oisd.nl/domainswild2 | grep -vE '^\s*(#|$)' > oisd_small_domainswild2.txt || silent_error "Failed to download the domains list"
+# --- Download the latest domain lists ---
 
-# Check if the file has changed
-git diff --exit-code oisd_small_domainswild2.txt > /dev/null && silent_error "The domains list has not changed"
+echo "Downloading OISD small..."
+curl -sSfL --retry "$MAX_RETRIES" --retry-all-errors "https://small.oisd.nl/domainswild2" | grep -vE '^\s*(#|$)' > oisd_small_domainswild2.txt.new || error "Failed to download the OISD list"
+[[ -s oisd_small_domainswild2.txt.new ]] || error "The OISD list is empty"
 
-# Ensure the file is not empty
-[[ -s oisd_small_domainswild2.txt ]] || error "The domains list is empty"
+echo "Downloading Hagezi Light..."
+curl -sSfL --retry "$MAX_RETRIES" --retry-all-errors "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/light-onlydomains.txt" | grep -vE '^\s*(#|$)' > hagezi_light_onlydomains.txt.new || error "Failed to download the Hagezi list"
+[[ -s hagezi_light_onlydomains.txt.new ]] || error "The Hagezi list is empty"
 
-# Calculate the number of lines in the file
-total_lines=$(wc -l < oisd_small_domainswild2.txt)
+# --- Sanity check against the account-wide list cap before creating anything ---
 
-# Ensure the file is not over the maximum allowed lines
-(( total_lines <= MAX_LIST_SIZE * MAX_LISTS )) || error "The domains list has more than $((MAX_LIST_SIZE * MAX_LISTS)) lines"
+oisd_lines=$(wc -l < oisd_small_domainswild2.txt.new)
+hagezi_lines=$(wc -l < hagezi_light_onlydomains.txt.new)
+oisd_lists_needed=$(( (oisd_lines + MAX_LIST_SIZE - 1) / MAX_LIST_SIZE ))
+hagezi_lists_needed=$(( (hagezi_lines + MAX_LIST_SIZE - 1) / MAX_LIST_SIZE ))
+total_needed=$(( oisd_lists_needed + hagezi_lists_needed ))
 
-# Calculate the number of lists required
-total_lists=$((total_lines / MAX_LIST_SIZE))
-[[ $((total_lines % MAX_LIST_SIZE)) -ne 0 ]] && total_lists=$((total_lists + 1))
+echo "OISD: ${oisd_lines} domains -> ${oisd_lists_needed} lists"
+echo "Hagezi Light: ${hagezi_lines} domains -> ${hagezi_lists_needed} lists"
+echo "Total lists needed: ${total_needed} (account limit: ${MAX_LISTS})"
 
-# Get current lists from Cloudflare
-current_lists=$(curl -sSfL --retry "$MAX_RETRIES" --retry-all-errors -X GET "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/gateway/lists" \
-    -H "Authorization: Bearer ${API_TOKEN}" \
-    -H "Content-Type: application/json") || error "Failed to get current lists from Cloudflare"
-    
-# Get current policies from Cloudflare
-current_policies=$(curl -sSfL --retry "$MAX_RETRIES" --retry-all-errors -X GET "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/gateway/rules" \
-    -H "Authorization: Bearer ${API_TOKEN}" \
-    -H "Content-Type: application/json") || error "Failed to get current policies from Cloudflare"
+(( total_needed <= MAX_LISTS )) || error "Combined lists needed (${total_needed}) exceeds the account limit of ${MAX_LISTS}. Aborting without making changes."
 
-# Count number of lists that have $PREFIX in name
-current_lists_count=$(echo "${current_lists}" | jq -r --arg PREFIX "${PREFIX}" 'if (.result | length > 0) then .result | map(select(.name | contains($PREFIX))) | length else 0 end') || error "Failed to count current lists"
+# --- Fetch current state ---
 
-# Count number of lists without $PREFIX in name
-current_lists_count_without_prefix=$(echo "${current_lists}" | jq -r --arg PREFIX "${PREFIX}" 'if (.result | length > 0) then .result | map(select(.name | contains($PREFIX) | not)) | length else 0 end') || error "Failed to count current lists without prefix"
+echo "Fetching current policies..."
+current_policies=$(api GET "/gateway/rules") || error "Failed to fetch current policies"
 
-# Ensure total_lists name is less than or equal to $MAX_LISTS - current_lists_count_without_prefix
-[[ ${total_lists} -le $((MAX_LISTS - current_lists_count_without_prefix)) ]] || error "The number of lists required (${total_lists}) is greater than the maximum allowed (${MAX_LISTS - current_lists_count_without_prefix})"
+echo "Fetching current lists..."
+current_lists=$(api GET "/gateway/lists") || error "Failed to fetch current lists"
 
-# Split lists into chunks of $MAX_LIST_SIZE
-split -l ${MAX_LIST_SIZE} oisd_small_domainswild2.txt oisd_small_domainswild2.txt. || error "Failed to split the domains list"
-
-# Create array of chunked lists
-chunked_lists=()
-for file in oisd_small_domainswild2.txt.*; do
-    chunked_lists+=("${file}")
-done
-
-# Create array of used list IDs
-used_list_ids=()
-
-# Create array of excess list IDs
-excess_list_ids=()
-
-# Create list counter
-list_counter=1
-
-# Update existing lists
-if [[ ${current_lists_count} -gt 0 ]]; then
-    # For each list ID
-    for list_id in $(echo "${current_lists}" | jq -r --arg PREFIX "${PREFIX}" '.result | map(select(.name | contains($PREFIX))) | .[].id'); do
-        # If there are no more chunked lists, mark the list ID for deletion
-        [[ ${#chunked_lists[@]} -eq 0 ]] && {
-            echo "Marking list ${list_id} for deletion..."
-            excess_list_ids+=("${list_id}")
-            continue
-        }
-
-        echo "Updating list ${list_id}..."
-
-        # Get list contents
-        list_items=$(curl -sSfL --retry "$MAX_RETRIES" --retry-all-errors -X GET "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/gateway/lists/${list_id}/items?limit=${MAX_LIST_SIZE}" \
-        -H "Authorization: Bearer ${API_TOKEN}" \
-        -H "Content-Type: application/json") || error "Failed to get list ${list_id} contents"
-
-        # Create list item values for removal
-        list_items_values=$(echo "${list_items}" | jq -r '.result | map(.value) | map(select(. != null))')
-
-        # Create list item array for appending from first chunked list
-        list_items_array=$(jq -R -s 'split("\n") | map(select(length > 0) | { "value": . })' "${chunked_lists[0]}")
-
-        # Create payload
-        payload=$(jq -n --argjson append_items "$list_items_array" --argjson remove_items "$list_items_values" '{
-            "append": $append_items,
-            "remove": $remove_items
-        }')
-
-        # Patch list
-        list=$(curl -sSfL --retry "$MAX_RETRIES" --retry-all-errors -X PATCH "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/gateway/lists/${list_id}" \
-        -H "Authorization: Bearer ${API_TOKEN}" \
-        -H "Content-Type: application/json" \
-        --data "$payload") || error "Failed to patch list ${list_id}"
-
-        # Store the list ID
-        used_list_ids+=("${list_id}")
-
-        # Delete the first chunked file and in the list
-        rm -f "${chunked_lists[0]}"
-        chunked_lists=("${chunked_lists[@]:1}")
-
-        # Increment list counter
-        list_counter=$((list_counter + 1))
+# Creates fresh Cloudflare Lists for a domain file, named with a unique run suffix
+# so they never collide with lists from a previous run. Prints the created list
+# IDs (space separated) to stdout; progress goes to stderr.
+function create_lists_for_source() {
+    local prefix="$1" file="$2"
+    split -l "$MAX_LIST_SIZE" "$file" "${file}.chunk."
+    local ids=()
+    local n=1
+    for chunk in "${file}.chunk."*; do
+        local items name payload resp id
+        items=$(jq -R -s 'split("\n") | map(select(length>0) | { "value": . })' "$chunk")
+        name=$(printf "%s %s - %03d" "$prefix" "$RUN_ID" "$n")
+        payload=$(jq -n --arg n "$name" --argjson items "$items" '{"name":$n,"type":"DOMAIN","items":$items}')
+        resp=$(api POST "/gateway/lists" "$payload") || error "Failed creating list ${name}"
+        id=$(echo "$resp" | jq -r '.result.id // empty')
+        [[ -n "$id" ]] || error "No id returned when creating list ${name}: ${resp}"
+        echo "Created list ${name} (${id})" >&2
+        ids+=("$id")
+        n=$((n+1))
+        rm -f "$chunk"
     done
-fi
+    echo "${ids[@]}"
+}
 
-# Create extra lists if required
-for file in "${chunked_lists[@]}"; do
-    echo "Creating list..."
+echo "Creating new OISD lists..."
+read -ra oisd_ids <<< "$(create_lists_for_source "Block ads - OISD" "oisd_small_domainswild2.txt.new")"
+echo "Created ${#oisd_ids[@]} OISD lists"
 
-    # Format list counter
-    formatted_counter=$(printf "%03d" "$list_counter")
+echo "Creating new Hagezi lists..."
+read -ra hagezi_ids <<< "$(create_lists_for_source "Block ads - Hagezi" "hagezi_light_onlydomains.txt.new")"
+echo "Created ${#hagezi_ids[@]} Hagezi lists"
 
-    # Create payload
-    payload=$(jq -n --arg PREFIX "${PREFIX} - ${formatted_counter}" --argjson items "$(jq -R -s 'split("\n") | map(select(length > 0) | { "value": . })' "${file}")" '{
-        "name": $PREFIX,
-        "type": "DOMAIN",
-        "items": $items
+# --- Build and upsert the two location-scoped block policies ---
+
+# Home gets OISD only (comprehensive, low-breakage baseline for the whole household).
+# Personal gets OISD + Hagezi Light (the more thorough combination) for Mac/iPhone/iPad.
+
+function build_traffic() {
+    local location_id="$1"; shift
+    local clauses=()
+    for id in "$@"; do
+        clauses+=("any(dns.domains[*] in \$${id})")
+    done
+    local joined
+    joined=$(printf ' or %s' "${clauses[@]}")
+    joined=${joined:4}
+    echo "dns.location in {\"${location_id}\"} and (${joined})"
+}
+
+function upsert_policy() {
+    local name="$1" location_id="$2"; shift 2
+    local traffic policy_id payload
+    traffic=$(build_traffic "$location_id" "$@")
+    policy_id=$(echo "$current_policies" | jq -r --arg N "$name" '.result[] | select(.name==$N) | .id // empty')
+    payload=$(jq -n --arg name "$name" --arg traffic "$traffic" '{
+        name: $name,
+        traffic: $traffic,
+        action: "block",
+        enabled: true,
+        filters: ["dns"],
+        rule_settings: {
+            block_page_enabled: false,
+            block_reason: ""
+        }
     }')
-
-    # Create list
-    list=$(curl -sSfL --retry "$MAX_RETRIES" --retry-all-errors -X POST "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/gateway/lists" \
-        -H "Authorization: Bearer ${API_TOKEN}" \
-        -H "Content-Type: application/json" \
-        --data "$payload") || error "Failed to create list"
-
-    # Store the list ID
-    used_list_ids+=("$(echo "${list}" | jq -r '.result.id')")
-
-    # Delete the file
-    rm -f "${file}"
-
-    # Increment list counter
-    list_counter=$((list_counter + 1))
-done
-
-# Ensure policy called exactly $PREFIX exists, else create it
-policy_id=$(echo "${current_policies}" | jq -r --arg PREFIX "${PREFIX}" '.result | map(select(.name == $PREFIX)) | .[0].id') || error "Failed to get policy ID"
-
-# Initialize an empty array to store conditions
-conditions=()
-
-# Loop through the used_list_ids and build the "conditions" array dynamically
-[[ ${#used_list_ids[@]} -eq 1 ]] && {
-    conditions='
-                "any": {
-                    "in": {
-                        "lhs": {
-                            "splat": "dns.domains"
-                        },
-                        "rhs": "$'"${used_list_ids[0]}"'"
-                    }
-                }'
-} || {
-    for list_id in "${used_list_ids[@]}"; do
-        conditions+=('{
-                "any": {
-                    "in": {
-                        "lhs": {
-                            "splat": "dns.domains"
-                        },
-                        "rhs": "$'"$list_id"'"
-                    }
-                }
-        }')
-    done
-    conditions=$(IFS=','; echo "${conditions[*]}")
-    conditions='"or": ['"$conditions"']'
+    if [[ -z "$policy_id" ]]; then
+        echo "Creating policy ${name}..."
+        api POST "/gateway/rules" "$payload" > /dev/null || error "Failed creating policy ${name}"
+    else
+        echo "Updating policy ${name} (${policy_id})..."
+        api PUT "/gateway/rules/${policy_id}" "$payload" > /dev/null || error "Failed updating policy ${name}"
+    fi
 }
 
-# Create the JSON data dynamically
-json_data='{
-    "name": "'${PREFIX}'",
-    "conditions": [
-        {
-            "type":"traffic",
-            "expression":{
-                '"$conditions"'
-            }
-        }
-    ],
-    "action":"block",
-    "enabled":true,
-    "description":"",
-    "rule_settings":{
-        "block_page_enabled":false,
-        "block_reason":"",
-        "biso_admin_controls": {
-            "dcp":false,
-            "dcr":false,
-            "dd":false,
-            "dk":false,
-            "dp":false,
-            "du":false
-        },
-        "add_headers":{},
-        "ip_categories":false,
-        "override_host":"",
-        "override_ips":null,
-        "l4override":null,
-        "check_session":null
-    },
-    "filters":["dns"]
-}'
+upsert_policy "Block ads - Home" "$HOME_LOCATION_ID" "${oisd_ids[@]}"
+upsert_policy "Block ads - Personal" "$PERSONAL_LOCATION_ID" "${oisd_ids[@]}" "${hagezi_ids[@]}"
 
-[[ -z "${policy_id}" || "${policy_id}" == "null" ]] &&
-{
-    # Create the policy
-    echo "Creating policy..."
-    curl -sSfL --retry "$MAX_RETRIES" --retry-all-errors -X POST "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/gateway/rules" \
-        -H "Authorization: Bearer ${API_TOKEN}" \
-        -H "Content-Type: application/json" \
-        --data "$json_data" > /dev/null || error "Failed to create policy"
-} ||
-{
-    # Update the policy
-    echo "Updating policy ${policy_id}..."
-    curl -sSfL --retry "$MAX_RETRIES" --retry-all-errors -X PUT "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/gateway/rules/${policy_id}" \
-        -H "Authorization: Bearer ${API_TOKEN}" \
-        -H "Content-Type: application/json" \
-        --data "$json_data" > /dev/null || error "Failed to update policy"
-}
+# --- Clean up lists from the previous run, now that the policies point at the new ones ---
 
-# Delete excess lists in $excess_list_ids
-for list_id in "${excess_list_ids[@]}"; do
-    echo "Deleting list ${list_id}..."
-    curl -sSfL --retry "$MAX_RETRIES" --retry-all-errors -X DELETE "https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}/gateway/lists/${list_id}" \
-        -H "Authorization: Bearer ${API_TOKEN}" \
-        -H "Content-Type: application/json" > /dev/null || error "Failed to delete list ${list_id}"
-done
+echo "Deleting superseded lists..."
+old_ids=$(echo "$current_lists" | jq -r '.result[] | select((.name | startswith("Block ads - OISD")) or (.name | startswith("Block ads - Hagezi"))) | .id')
+while IFS= read -r id; do
+    [[ -z "$id" ]] && continue
+    echo "Deleting old list ${id}..."
+    api DELETE "/gateway/lists/${id}" > /dev/null || echo "Warning: failed to delete list ${id}"
+done <<< "$old_ids"
 
-# Add, commit and push the file
+# --- Commit the updated source files back to the repo ---
+
+mv oisd_small_domainswild2.txt.new oisd_small_domainswild2.txt
+mv hagezi_light_onlydomains.txt.new hagezi_light_onlydomains.txt
+
 git config --global user.email "${GITHUB_ACTOR_ID}+${GITHUB_ACTOR}@users.noreply.github.com"
 git config --global user.name "$(gh api /users/${GITHUB_ACTOR} | jq .name -r)"
-git add oisd_small_domainswild2.txt || error "Failed to add the domains list to repo"
-git commit -m "Update domains list" --author=. || error "Failed to commit the domains list to repo"
-git push origin main || error "Failed to push the domains list to repo"
+git add oisd_small_domainswild2.txt hagezi_light_onlydomains.txt
+git diff --staged --quiet || git commit -m "Update domain lists"
+git push origin main || echo "Nothing to push"
