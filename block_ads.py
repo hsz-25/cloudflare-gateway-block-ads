@@ -50,13 +50,17 @@ Capacity safety valve:
   CAPACITY_DOWNGRADE_THRESHOLD below.
 
 Scheduling:
-  GitHub Actions cron is fixed to UTC and has no concept of Daylight Saving Time, so a
-  single cron line can't reliably mean "5 AM Central" year-round. The workflow instead
-  schedules TWO cron times (one for each side of the DST transition); within_target_window()
-  below makes sure only the one that's actually ~5 AM Central does real work, and the other
-  is a harmless no-op. This guard only applies to the automatic schedule trigger - manually
-  running the workflow (workflow_dispatch), e.g. from the "Sync Now" button in the Home
-  Network Dashboard, always runs immediately regardless of time of day.
+  The workflow's cron is aimed at ~5 AM Central (two UTC entries bracket the DST
+  transition), but GitHub Actions schedule triggers are best-effort and can fire
+  significantly late under load - observed in practice firing over 5 hours after
+  the configured time. An earlier version of this script enforced a strict "only
+  do real work if it's actually 5:00-5:29 AM Central right now" window and
+  skipped everything otherwise; that made the sync silently no-op on any day
+  GitHub delayed the trigger past the window, which defeats the entire point of
+  having a nightly sync. There is no time-of-day gate anymore: every scheduled
+  trigger does real work, whenever it actually fires. Two cron entries still
+  exist so there are two chances per day for GitHub to actually run it near the
+  intended time, but neither is ever skipped for being "too late."
 """
 import hashlib
 import json
@@ -125,22 +129,6 @@ def log(msg):
 def die(msg):
     print(f"Error: {msg}", file=sys.stderr, flush=True)
     sys.exit(1)
-
-
-def is_scheduled_run():
-    return os.environ.get("GITHUB_EVENT_NAME") == "schedule"
-
-
-def within_target_window():
-    """
-    True if it's currently ~5:00-5:29 AM in America/Chicago. Two cron entries (10:00 and
-    11:00 UTC) bracket the CDT/CST 5 AM Central moment across the year; whichever one
-    doesn't land in this window is expected to no-op every single day it fires - that is
-    normal, not an error.
-    """
-    from zoneinfo import ZoneInfo
-    now_central = datetime.now(ZoneInfo("America/Chicago"))
-    return now_central.hour == 5 and now_central.minute < 30
 
 
 def api(method, path, data=None, retries=6, fatal=True):
@@ -396,12 +384,6 @@ def resolve_pro_source(state, whitelist_count):
 
 def main():
     state = load_state()
-
-    if is_scheduled_run() and not within_target_window():
-        log("Scheduled run outside the ~5:00 AM Central target window (this cron entry exists "
-            "only to cover the other side of the Daylight Saving transition) - skipping without "
-            "contacting Cloudflare. This happens once a day, every day, and is expected.")
-        return
 
     log("Downloading Hagezi Normal...")
     normal_domains = download_domains(HAGEZI_NORMAL_URL)
