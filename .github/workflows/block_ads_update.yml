@@ -8,7 +8,12 @@ on:
         type: boolean
         default: false
   schedule:
-    - cron: '0 4 * * *'
+    # Two entries bracketing the DST transition so the real target - ~5:00 AM Central -
+    # is hit year-round: GitHub Actions cron is fixed UTC with no DST awareness, so
+    # block_ads.py itself checks the actual America/Chicago wall clock and skips the
+    # entry that doesn't land near 5 AM Central that day (see within_target_window()).
+    - cron: '0 10 * * *'   # 5:00 AM Central during Daylight Time (CDT, UTC-5)
+    - cron: '0 11 * * *'   # 5:00 AM Central during Standard Time (CST, UTC-6)
 
 permissions:
   contents: write
@@ -27,6 +32,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_ACTOR_ID: ${{ github.actor_id }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: |
           if [ "${{ github.event.inputs.audit }}" = "true" ]; then
             python3 block_ads.py --audit
