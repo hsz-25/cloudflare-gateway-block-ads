@@ -41,6 +41,22 @@ Update strategy (this is the important part):
 
   A small state file (state.json, committed back to the repo) hashes the last-synced
   source files so unchanged blocklists skip all Cloudflare API calls entirely.
+
+Capacity safety valve:
+  If Normal+Delta ever approaches Cloudflare's real 300,000-domain / 300-list cap, this
+  script automatically and permanently switches the Personal policy's second source from
+  full Hagezi Pro to the smaller, curated Hagezi Pro Mini list (still layered on top of
+  Normal), so the account never runs out of room without anyone having to intervene. See
+  CAPACITY_DOWNGRADE_THRESHOLD below.
+
+Scheduling:
+  GitHub Actions cron is fixed to UTC and has no concept of Daylight Saving Time, so a
+  single cron line can't reliably mean "5 AM Central" year-round. The workflow instead
+  schedules TWO cron times (one for each side of the DST transition); within_target_window()
+  below makes sure only the one that's actually ~5 AM Central does real work, and the other
+  is a harmless no-op. This guard only applies to the automatic schedule trigger - manually
+  running the workflow (workflow_dispatch), e.g. from the "Sync Now" button in the Home
+  Network Dashboard, always runs immediately regardless of time of day.
 """
 import hashlib
 import json
@@ -50,6 +66,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 
 API_TOKEN = os.environ["API_TOKEN"]
 ACCOUNT_ID = os.environ["ACCOUNT_ID"]
@@ -64,11 +81,24 @@ PERSONAL_LOCATION_ID = "6b497a05ed454984b33cbf3554ca544b"
 
 HAGEZI_NORMAL_URL = "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/multi-onlydomains.txt"
 HAGEZI_PRO_URL = "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro-onlydomains.txt"
+HAGEZI_PRO_MINI_URL = "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro.mini-onlydomains.txt"
 
 NORMAL_PREFIX = "Block ads - Hagezi Normal"
 DELTA_PREFIX = "Block ads - Hagezi ProDelta"
+WHITELIST_PREFIX = "Allow - Whitelist"
 
 STATE_FILE = "state.json"
+
+# Real cap is 300 lists x 1,000 entries = 300,000. Once a prospective sync would put
+# Normal+Delta+Whitelist combined at or above this, permanently switch Personal's second
+# source from full Hagezi Pro (~234k domains, ~83k of them not already in Normal) to
+# Hagezi Pro Mini (~72k domains, ~35k not already in Normal) - same *kind* of coverage
+# (ads/trackers/malware/phishing), just a smaller curated set. Switching drops the
+# combined total from ~244k to ~200k in one run, so even a threshold this close to the
+# real cap lands safely once triggered - it's a big one-time drop, not a slow approach to
+# the wall. One-way switch by design: no automatic switching back, so behavior never
+# flaps night to night.
+CAPACITY_DOWNGRADE_THRESHOLD = 299_000
 
 
 def is_retired(name):
@@ -95,6 +125,22 @@ def log(msg):
 def die(msg):
     print(f"Error: {msg}", file=sys.stderr, flush=True)
     sys.exit(1)
+
+
+def is_scheduled_run():
+    return os.environ.get("GITHUB_EVENT_NAME") == "schedule"
+
+
+def within_target_window():
+    """
+    True if it's currently ~5:00-5:29 AM in America/Chicago. Two cron entries (10:00 and
+    11:00 UTC) bracket the CDT/CST 5 AM Central moment across the year; whichever one
+    doesn't land in this window is expected to no-op every single day it fires - that is
+    normal, not an error.
+    """
+    from zoneinfo import ZoneInfo
+    now_central = datetime.now(ZoneInfo("America/Chicago"))
+    return now_central.hour == 5 and now_central.minute < 30
 
 
 def api(method, path, data=None, retries=6, fatal=True):
@@ -318,26 +364,77 @@ def git(*args):
     subprocess.run(["git", *args], check=True)
 
 
-def main():
-    log("Downloading Hagezi Normal + Pro...")
+def resolve_pro_source(state, whitelist_count):
+    """
+    Decides which Hagezi Pro variant feeds the Personal policy's delta this run, and
+    whether that decision needs to change (the capacity safety valve). Returns
+    (pro_domains, pro_label, mode, downgraded_this_run).
+    """
+    previous_mode = state.get("blocklist_mode", "full_pro")
+
+    if previous_mode == "pro_mini":
+        # Already downgraded in an earlier run - one-way switch, stay on Mini.
+        return download_domains(HAGEZI_PRO_MINI_URL), "Hagezi Pro Mini", "pro_mini", False
+
     normal_domains = download_domains(HAGEZI_NORMAL_URL)
     pro_domains = download_domains(HAGEZI_PRO_URL)
+    delta_domains = pro_domains - normal_domains
+    prospective_total = len(normal_domains) + len(delta_domains) + whitelist_count
+
+    if prospective_total < CAPACITY_DOWNGRADE_THRESHOLD:
+        return pro_domains, "Hagezi Pro", "full_pro", False
+
+    log(f"WARNING: Normal+Delta+Whitelist would be {prospective_total} domains this run, at or "
+        f"above the {CAPACITY_DOWNGRADE_THRESHOLD}-domain safety threshold (Cloudflare's real cap "
+        f"is {MAX_LISTS * CHUNK_SIZE}). Automatically switching the Personal policy's second "
+        f"source from full Hagezi Pro to Hagezi Pro Mini to stay safely under the cap - same kind "
+        f"of ad/tracker/malware/phishing coverage, a smaller curated domain set. This is a "
+        f"one-way, permanent change: Personal keeps using Pro Mini on every future run, it does "
+        f"not automatically switch back even if the list shrinks later.")
+    return download_domains(HAGEZI_PRO_MINI_URL), "Hagezi Pro Mini", "pro_mini", True
+
+
+def main():
+    state = load_state()
+
+    if is_scheduled_run() and not within_target_window():
+        log("Scheduled run outside the ~5:00 AM Central target window (this cron entry exists "
+            "only to cover the other side of the Daylight Saving transition) - skipping without "
+            "contacting Cloudflare. This happens once a day, every day, and is expected.")
+        return
+
+    log("Downloading Hagezi Normal...")
+    normal_domains = download_domains(HAGEZI_NORMAL_URL)
     if not normal_domains:
         die("Hagezi Normal download is empty")
+
+    log("Fetching current Gateway lists (needed for the capacity check and the sync itself)...")
+    current_lists = paginate("/gateway/lists")
+    whitelist_count = sum(
+        l.get("count", 0) for l in current_lists if l["name"].startswith(WHITELIST_PREFIX)
+    )
+
+    log("Resolving Hagezi Pro source (checking capacity safety valve)...")
+    pro_domains, pro_label, mode, downgraded_this_run = resolve_pro_source(state, whitelist_count)
     if not pro_domains:
-        die("Hagezi Pro download is empty")
+        die(f"{pro_label} download is empty")
 
     delta_domains = pro_domains - normal_domains
     if not delta_domains:
-        die("Hagezi Pro delta is empty - something is wrong upstream")
+        die(f"{pro_label} delta is empty - something is wrong upstream")
 
     log(f"Hagezi Normal: {len(normal_domains)} domains")
-    log(f"Hagezi Pro delta (Pro minus Normal): {len(delta_domains)} domains")
+    log(f"{pro_label} delta ({pro_label} minus Normal): {len(delta_domains)} domains")
+    log(f"Whitelist: {whitelist_count} domains")
+    log(f"Combined Normal+Delta+Whitelist target: "
+        f"{len(normal_domains) + len(delta_domains) + whitelist_count} of "
+        f"{MAX_LISTS * CHUNK_SIZE} max ({mode} mode)")
 
-    state = load_state()
     normal_hash = sha256_of(normal_domains)
     delta_hash = sha256_of(delta_domains)
-    if state.get("normal_sha256") == normal_hash and state.get("delta_sha256") == delta_hash:
+    if (not downgraded_this_run and state.get("normal_sha256") == normal_hash
+            and state.get("delta_sha256") == delta_hash
+            and state.get("blocklist_mode", "full_pro") == mode):
         log("No change in either source since the last successful sync. Nothing to do.")
         return
 
@@ -348,9 +445,6 @@ def main():
         # Unlike list items, getting this wrong is dangerous: if we mistakenly think no
         # policy exists, upsert_policy() would create a duplicate instead of updating.
         die(f"Fetching current Gateway policies returned no result body: {rules_resp}")
-
-    log("Fetching current Gateway lists...")
-    current_lists = paginate("/gateway/lists")
 
     normal_lists = sorted(
         (l for l in current_lists if l["name"].startswith(NORMAL_PREFIX)),
@@ -433,7 +527,12 @@ def main():
     for lid in to_delete:
         api("DELETE", f"/gateway/lists/{lid}", fatal=False)
 
-    save_state({"normal_sha256": normal_hash, "delta_sha256": delta_hash})
+    new_state = {"normal_sha256": normal_hash, "delta_sha256": delta_hash, "blocklist_mode": mode}
+    if downgraded_this_run:
+        new_state["blocklist_mode_switched_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    elif "blocklist_mode_switched_at" in state:
+        new_state["blocklist_mode_switched_at"] = state["blocklist_mode_switched_at"]
+    save_state(new_state)
 
     actor = os.environ.get("GITHUB_ACTOR", "github-actions")
     actor_id = os.environ.get("GITHUB_ACTOR_ID", "41898282")
