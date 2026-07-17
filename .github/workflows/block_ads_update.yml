@@ -8,12 +8,20 @@ on:
         type: boolean
         default: false
   schedule:
-    # Two entries bracketing the DST transition so the real target - ~5:00 AM Central -
-    # is hit year-round: GitHub Actions cron is fixed UTC with no DST awareness, so
-    # block_ads.py itself checks the actual America/Chicago wall clock and skips the
-    # entry that doesn't land near 5 AM Central that day (see within_target_window()).
-    - cron: '0 10 * * *'   # 5:00 AM Central during Daylight Time (CDT, UTC-5)
-    - cron: '0 11 * * *'   # 5:00 AM Central during Standard Time (CST, UTC-6)
+    # Two real syncs a day: one morning (~8 AM Central), one evening (~6 PM
+    # Central). These are independent runs, NOT a DST-bracketed pair where one
+    # is discarded - block_ads.py runs its full sync on every scheduled trigger
+    # and never skips for lateness (see its module docstring).
+    #
+    # GitHub Actions cron is fixed UTC with no DST awareness. These UTC times are
+    # centered on Central Daylight Time, so they drift ~1h across the DST
+    # boundary (during Standard Time they land ~7 AM / ~5 PM Central) - close
+    # enough for "around 8 AM and 6 PM". Deliberately at :17, NOT the top of the
+    # hour: GitHub's scheduler is best-effort and the :00 slot is its most
+    # backlogged - this repo was observed firing 5+ hours late at '0 10'/'0 11';
+    # an off-peak minute fires far closer to on time.
+    - cron: '17 13 * * *'   # ~8:17 AM Central (13:17 UTC: 8:17 CDT / 7:17 CST)
+    - cron: '17 23 * * *'   # ~6:17 PM Central (23:17 UTC: 18:17 CDT / 17:17 CST)
 
 permissions:
   contents: write
