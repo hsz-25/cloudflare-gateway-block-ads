@@ -319,24 +319,19 @@ def sync_list_set(prefix, target_domains, existing_lists, budget):
     return kept_ids, empty_ids, lists_created, budget
 
 
-# Security Threats (Cloudflare's built-in category feed) and DNS Rebinding
-# Protection (blocks a resolved IP landing in a private/internal range) are
-# folded directly into Home/Personal's own traffic expression, rather than
-# living as separate Gateway rules - by explicit request, to keep the total
-# policy count down to just Whitelist / Focus Block / Home / Personal. Because
-# THIS function fully rebuilds Home/Personal's traffic on every run, these two
-# extra clauses must be appended HERE (not left as standalone rules) or the
-# very next sync would silently overwrite them away with no warning. If
-# Cloudflare ever changes these security-category IDs, they'd need updating
-# here too - there is no separate rule left to edit instead.
-SECURITY_CATEGORY_IDS = "178 80 176 187 83 175 117 131 188 134 191 151 153 68"
-PRIVATE_IP_RANGES = "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 127.0.0.0/8 169.254.0.0/16 100.64.0.0/10 fc00::/7 fe80::/10 ::1"
-
-
+# Security Threats category blocking and DNS Rebinding Protection are SEPARATE
+# Gateway rules ("Security Threats Block (Home + Personal)" and "DNS Rebinding
+# Protection"), deliberately NOT folded into this ad-block traffic expression.
+# They were briefly folded in to reduce the policy count, but that broke the
+# dashboard's ability to filter for them: Cloudflare's free analytics API can
+# only filter the query log by policyName (not by security-category or resolved
+# IP), and it samples out rare events - so with them buried inside Home/Personal
+# they became unretrievable. Keeping them as their own named rules is what lets
+# the app reliably surface and filter them. This function fully rebuilds
+# Home/Personal's traffic each run, so anything added here would be wiped every
+# sync anyway - another reason those two stay separate.
 def build_traffic(location_id, list_ids):
     clauses = " or ".join(f"any(dns.domains[*] in ${lid})" for lid in list_ids)
-    clauses += f" or any(dns.security_category[*] in {{{SECURITY_CATEGORY_IDS}}})"
-    clauses += f" or any(dns.resolved_ips[*] in {{{PRIVATE_IP_RANGES}}})"
     return f'dns.location in {{"{location_id}"}} and ({clauses})'
 
 
