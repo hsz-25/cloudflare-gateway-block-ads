@@ -3,6 +3,8 @@
 Home + Personal Cloudflare Gateway blocklist sync.
 
 Sources:
+  Fetched from the first working mirror in HAGEZI_MIRRORS (see that constant - the
+  upstream GitHub account going away once took this sync down for days):
   - Hagezi Normal      (ads, affiliate, tracking, metrics, telemetry, phishing, malware...)
   - Hagezi Pro "delta" (only the domains in Hagezi Pro that are NOT already in Hagezi
                          Normal - Pro is a superset of Normal, so we avoid paying for the
@@ -83,9 +85,43 @@ MAX_LISTS = 300            # empirically-verified enforced cap on this account
 HOME_LOCATION_ID = "3d4d56f8749d41ea97d291ec5faf3de7"
 PERSONAL_LOCATION_ID = "6b497a05ed454984b33cbf3554ca544b"
 
-HAGEZI_NORMAL_URL = "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/multi-onlydomains.txt"
-HAGEZI_PRO_URL = "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro-onlydomains.txt"
-HAGEZI_PRO_MINI_URL = "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro.mini-onlydomains.txt"
+HAGEZI_NORMAL_FILE = "multi-onlydomains.txt"
+HAGEZI_PRO_FILE = "pro-onlydomains.txt"
+HAGEZI_PRO_MINI_FILE = "pro.mini-onlydomains.txt"
+
+# Where to fetch the Hagezi lists from, in priority order. This used to be a single
+# hardcoded raw.githubusercontent.com URL, which is what broke every run from
+# 2026-08-09 onward: the whole github.com/hagezi ACCOUNT was locked, so all three
+# source URLs started returning 404, download_domains() raised, and the job exited 1.
+# Nothing was wrong with Cloudflare or with this script's sync logic - the source
+# just vanished. Each mirror below is tried in order and the first one that returns
+# a plausible list wins:
+#   1. raw.githubusercontent - the canonical source. Kept FIRST so that the moment
+#      hagezi's account is restored, the sync silently goes back to upstream with no
+#      code change needed. Costs one wasted 404 per file per run while it's down.
+#   2. dnsbunker mirror - community mirror stood up during the lockout, refreshed
+#      daily (verified serving same-day list versions while GitHub was 404ing).
+#   3. jsDelivr @latest - CDN cache of the original repo. It survives the repo being
+#      gone entirely, but it is FROZEN at whatever it last cached (it was still
+#      serving the 2026-08-09 build days later), so it is the last resort, not the
+#      first choice - a stale-but-working blocklist beats no sync at all.
+HAGEZI_MIRRORS = [
+    "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/",
+    "https://hagezi-mirror.dnsbunker.org/wildcard/",
+    "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/",
+]
+
+# Sanity floor per source file. A mirror that answers HTTP 200 with a truncated file,
+# an error page, or a Cloudflare interstitial would otherwise read as "the blocklist
+# legitimately shrank to almost nothing" - and because this script syncs by diffing,
+# it would then dutifully DELETE ~180k domains out of the Gateway lists and leave the
+# house unprotected. Well below the real sizes (~180k / ~215k / ~53k as of Aug 2026)
+# so normal upstream churn never trips it; high enough that no garbage response passes.
+HAGEZI_MIN_DOMAINS = {
+    HAGEZI_NORMAL_FILE: 100_000,
+    HAGEZI_PRO_FILE: 120_000,
+    HAGEZI_PRO_MINI_FILE: 25_000,
+}
 
 NORMAL_PREFIX = "Block ads - Hagezi Normal"
 DELTA_PREFIX = "Block ads - Hagezi ProDelta"
@@ -203,17 +239,52 @@ def chunks(seq, size):
         yield seq[i:i + size]
 
 
-def download_domains(url):
+def _fetch_domains_from(url):
     req = urllib.request.Request(url, headers={"User-Agent": "curl/8"})
     with urllib.request.urlopen(req, timeout=60) as resp:
         text = resp.read().decode()
     domains = set()
+    version = None
     for line in text.splitlines():
         line = line.strip()
-        if not line or line.startswith("#"):
+        if line.startswith("#"):
+            # Hagezi files carry a "# Version: 2026.0811.1825.51" header - worth
+            # logging so a run's output shows how fresh the source actually was.
+            if version is None and line.lower().startswith("# version:"):
+                version = line.split(":", 1)[1].strip()
             continue
-        domains.add(line)
-    return domains
+        if line:
+            domains.add(line)
+    return domains, version
+
+
+def download_domains(filename, retries=3):
+    """
+    Download one Hagezi source file, trying each mirror in HAGEZI_MIRRORS until one
+    returns a list that clears its sanity floor. Dies only if EVERY mirror fails -
+    a single dead source (see the HAGEZI_MIRRORS comment) no longer kills the run.
+    """
+    floor = HAGEZI_MIN_DOMAINS[filename]
+    failures = []
+    for base in HAGEZI_MIRRORS:
+        url = f"{base}{filename}"
+        for attempt in range(retries):
+            try:
+                domains, version = _fetch_domains_from(url)
+            except Exception as e:
+                # Retry the same mirror a couple of times before writing it off, so a
+                # transient blip doesn't demote us to a staler mirror for the whole run.
+                if attempt < retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                failures.append(f"{url}: {e}")
+                break
+            if len(domains) < floor:
+                failures.append(f"{url}: only {len(domains)} domains, below the {floor} sanity floor")
+                break
+            log(f"  {filename}: {len(domains)} domains from {base} (version {version or 'unknown'})")
+            return domains
+    die(f"Could not download {filename} from any known mirror:\n  " + "\n  ".join(failures))
 
 
 def sha256_of(domains):
@@ -368,10 +439,10 @@ def resolve_pro_source(state, whitelist_count):
 
     if previous_mode == "pro_mini":
         # Already downgraded in an earlier run - one-way switch, stay on Mini.
-        return download_domains(HAGEZI_PRO_MINI_URL), "Hagezi Pro Mini", "pro_mini", False
+        return download_domains(HAGEZI_PRO_MINI_FILE), "Hagezi Pro Mini", "pro_mini", False
 
-    normal_domains = download_domains(HAGEZI_NORMAL_URL)
-    pro_domains = download_domains(HAGEZI_PRO_URL)
+    normal_domains = download_domains(HAGEZI_NORMAL_FILE)
+    pro_domains = download_domains(HAGEZI_PRO_FILE)
     delta_domains = pro_domains - normal_domains
     prospective_total = len(normal_domains) + len(delta_domains) + whitelist_count
 
@@ -385,16 +456,14 @@ def resolve_pro_source(state, whitelist_count):
         f"of ad/tracker/malware/phishing coverage, a smaller curated domain set. This is a "
         f"one-way, permanent change: Personal keeps using Pro Mini on every future run, it does "
         f"not automatically switch back even if the list shrinks later.")
-    return download_domains(HAGEZI_PRO_MINI_URL), "Hagezi Pro Mini", "pro_mini", True
+    return download_domains(HAGEZI_PRO_MINI_FILE), "Hagezi Pro Mini", "pro_mini", True
 
 
 def main():
     state = load_state()
 
     log("Downloading Hagezi Normal...")
-    normal_domains = download_domains(HAGEZI_NORMAL_URL)
-    if not normal_domains:
-        die("Hagezi Normal download is empty")
+    normal_domains = download_domains(HAGEZI_NORMAL_FILE)
 
     log("Fetching current Gateway lists (needed for the capacity check and the sync itself)...")
     current_lists = paginate("/gateway/lists")
@@ -404,8 +473,6 @@ def main():
 
     log("Resolving Hagezi Pro source (checking capacity safety valve)...")
     pro_domains, pro_label, mode, downgraded_this_run = resolve_pro_source(state, whitelist_count)
-    if not pro_domains:
-        die(f"{pro_label} download is empty")
 
     delta_domains = pro_domains - normal_domains
     if not delta_domains:

@@ -27,7 +27,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        # v5 is the first release that runs on Node 24 (v4 was being force-run on 24
+        # and warning about it on every run). Deliberately NOT the newest major: v6
+        # changed where checkout persists the git credentials, and this job's last
+        # step is a plain `git push origin main` of state.json that relies on them.
+        # v5 is byte-for-byte the same credential behaviour as v4, so this upgrade
+        # clears the deprecation warning without touching how the push authenticates.
+        uses: actions/checkout@v5
 
       - name: Run the script
         env:
