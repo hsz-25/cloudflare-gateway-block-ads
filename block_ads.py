@@ -82,6 +82,12 @@ CHUNK_SIZE = 1000          # domains per Cloudflare list
 PATCH_BATCH = 1000         # domains per single PATCH append/remove call
 MAX_LISTS = 300            # empirically-verified enforced cap on this account
 
+# Don't bother repacking a tier unless doing so frees at least this many List
+# slots. Compaction costs two PATCH calls per 1,000 domains moved, so reclaiming
+# one or two slots every run is churn for its own sake; reclaiming five or more
+# is real headroom. See compact_lists().
+COMPACT_MIN_RECLAIM = 5
+
 HOME_LOCATION_ID = "3d4d56f8749d41ea97d291ec5faf3de7"
 PERSONAL_LOCATION_ID = "6b497a05ed454984b33cbf3554ca544b"
 
@@ -308,6 +314,115 @@ def save_state(state):
         f.write("\n")
 
 
+def reclaimable_slots(current_lists):
+    """
+    How many List slots a repack would hand back, per managed tier, using only the
+    `count` field the list endpoint already returns. Cheap enough to check on every
+    run, including runs that would otherwise exit early. See compact_lists().
+    """
+    total = 0
+    for prefix in (NORMAL_PREFIX, DELTA_PREFIX):
+        tier = [l for l in current_lists if l["name"].startswith(prefix)]
+        if not tier:
+            continue
+        domains = sum(l.get("count", 0) or 0 for l in tier)
+        perfect = (domains + CHUNK_SIZE - 1) // CHUNK_SIZE
+        total += max(0, len(tier) - perfect)
+    return total
+
+
+def compact_lists(prefix, current_map):
+    """
+    Repack a prefix's Lists so the same domains occupy as few Lists as possible.
+
+    WHY THIS EXISTS
+    ---------------
+    The diff/PATCH sync below never lets a List grow past CHUNK_SIZE, but nothing
+    ever pushed a List back UP toward full once churn had eaten into it, and a List
+    was only ever deleted at exactly zero domains. Every run removes domains
+    scattered across every List and adds a smaller number back, and the add phase
+    only fills existing Lists up to the size of that run's add queue - so the holes
+    punched by removals were never fully backfilled. The result was a one-way
+    ratchet: Lists drifted down toward small-but-nonzero and just sat there.
+
+    Observed before this function existed: 277 of the 300 allowed Lists holding only
+    224,261 domains. The ProDelta tier was the worst of it - 91 Lists holding 43,493
+    domains, an average of 478 out of a possible 1,000, wasting ~47 List slots on
+    nothing but fragmentation. The account looked 92% full while being 75% empty.
+
+    HOW IT WORKS
+    ------------
+    Sort by fill level, treat the fullest Lists as receivers and the emptiest as
+    donors, then move domains from donors into receivers' free space until the
+    donors are empty. Emptied donors fall out through the existing "delete Lists
+    that ended up empty" step, which already runs after the policies have been
+    repointed - so a List is only ever deleted once nothing references it.
+
+    SAFETY
+    ------
+    Domains are APPENDED to the receiver before being REMOVED from the donor, never
+    the other way around. If a run dies halfway through a move, the domain is in two
+    Lists at once - harmless duplicate blocking that the next run's diff cleans up.
+    The reverse order could leave a domain in neither List, i.e. silently unblocked.
+
+    Returns the number of Lists drained (they will read as empty to the caller).
+    """
+    placed = set()
+    for domains in current_map.values():
+        placed |= domains
+    needed = (len(placed) + CHUNK_SIZE - 1) // CHUNK_SIZE
+    reclaimable = len(current_map) - needed
+    if reclaimable < COMPACT_MIN_RECLAIM:
+        log(f"[{prefix}] packing is fine — {len(current_map)} lists for {len(placed)} domains "
+            f"(a perfect pack would need {needed}); not worth the API churn.")
+        return 0
+
+    by_fill = sorted(current_map, key=lambda lid: len(current_map[lid]), reverse=True)
+    receivers, donors = by_fill[:needed], by_fill[needed:]
+    free = sum(CHUNK_SIZE - len(current_map[r]) for r in receivers)
+
+    # Drain the emptiest donors first, and only ones that fit entirely in the
+    # receivers' free space — a partially drained donor reclaims no slot at all.
+    drained = []
+    used = 0
+    for d in sorted(donors, key=lambda lid: len(current_map[lid])):
+        if used + len(current_map[d]) <= free:
+            drained.append(d)
+            used += len(current_map[d])
+    if not drained:
+        return 0
+
+    moving = []
+    for d in drained:
+        moving.extend(sorted(current_map[d]))
+
+    log(f"[{prefix}] compacting: {len(current_map)} lists hold {len(placed)} domains "
+        f"(perfect pack = {needed}); moving {len(moving)} domains to drain {len(drained)} lists.")
+
+    # Append into receivers FIRST — coverage is never interrupted.
+    for r in receivers:
+        if not moving:
+            break
+        space = CHUNK_SIZE - len(current_map[r])
+        if space <= 0:
+            continue
+        take = [d for d in moving[:space] if d not in current_map[r]]
+        moving = moving[space:]
+        for batch in chunks(take, PATCH_BATCH):
+            api("PATCH", f"/gateway/lists/{r}", {"append": [{"value": d} for d in batch]})
+        current_map[r] |= set(take)
+
+    # ...and only now empty the donors.
+    for d in drained:
+        for batch in chunks(sorted(current_map[d]), PATCH_BATCH):
+            api("PATCH", f"/gateway/lists/{d}", {"remove": batch})
+        current_map[d] = set()
+
+    log(f"[{prefix}] compaction drained {len(drained)} lists; they will be deleted "
+        f"once the policies no longer reference them.")
+    return len(drained)
+
+
 def sync_list_set(prefix, target_domains, existing_lists, budget):
     """
     Diff/PATCH an existing set of Cloudflare Lists (identified by name prefix) so their
@@ -357,6 +472,12 @@ def sync_list_set(prefix, target_domains, existing_lists, budget):
             for batch in chunks(take, PATCH_BATCH):
                 api("PATCH", f"/gateway/lists/{lid}", {"append": [{"value": d} for d in batch]})
             current_map[lid] |= set(take)
+
+    # Backfilling above only ever moves domains INTO holes as big as this run's add
+    # queue. Anything left over is long-run fragmentation, so repack it now — before
+    # the new-list creation below, so any slot freed here is a slot that creation can
+    # spend instead of failing against the cap.
+    compact_lists(prefix, current_map)
 
     # Whatever's left needs brand new lists
     final_ids = [lst["id"] for lst in existing_lists]
@@ -487,11 +608,22 @@ def main():
 
     normal_hash = sha256_of(normal_domains)
     delta_hash = sha256_of(delta_domains)
+    # Reclaimable slots is checked alongside the source hashes because the two go
+    # out of sync: fragmentation is caused by PAST runs, so a day where nothing
+    # changed upstream is exactly the kind of day the old code would skip while
+    # leaving dozens of List slots stranded. Uses the `count` already returned by
+    # the list endpoint, so it costs no extra API calls.
+    reclaimable = reclaimable_slots(current_lists)
     if (not downgraded_this_run and state.get("normal_sha256") == normal_hash
             and state.get("delta_sha256") == delta_hash
-            and state.get("blocklist_mode", "full_pro") == mode):
-        log("No change in either source since the last successful sync. Nothing to do.")
+            and state.get("blocklist_mode", "full_pro") == mode
+            and reclaimable < COMPACT_MIN_RECLAIM):
+        log("No change in either source since the last successful sync, and the lists are "
+            "well packed. Nothing to do.")
         return
+    if reclaimable >= COMPACT_MIN_RECLAIM:
+        log(f"Lists are fragmented — about {reclaimable} of the {MAX_LISTS} slots are "
+            f"reclaimable by repacking. Running a sync to compact them.")
 
     log("Fetching current Gateway policies...")
     rules_resp = api("GET", "/gateway/rules")

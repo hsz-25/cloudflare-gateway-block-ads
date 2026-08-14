@@ -1,1 +1,3 @@
 oisd_small_domainswild2.txt.*
+__pycache__/
+*.pyc
