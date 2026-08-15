@@ -3,8 +3,7 @@
     "home": [
       "hagezi-multi",
       "hagezi-popupads",
-      "urlhaus",
-      "hagezi-doh"
+      "urlhaus"
     ],
     "personal": [
       "hagezi-pro",
@@ -62,7 +61,7 @@
       ]
     }
   },
-  "updated_at": "2026-08-15T03:19:19Z",
+  "updated_at": "2026-08-15T03:56:23Z",
   "updated_by": "Zamir Residence Dashboard",
   "version": 1
 }
