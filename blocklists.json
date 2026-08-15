@@ -3,14 +3,26 @@
     "home": [
       "hagezi-multi",
       "hagezi-popupads",
-      "urlhaus"
+      "urlhaus",
+      "hagezi-doh"
     ],
     "personal": [
       "hagezi-pro",
-      "urlhaus"
+      "urlhaus",
+      "hagezi-doh"
     ]
   },
   "sources": {
+    "hagezi-doh": {
+      "format": "domains",
+      "min_domains": 1,
+      "name": "Hagezi DoH Bypass",
+      "urls": [
+        "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/doh-onlydomains.txt",
+        "https://hagezi-mirror.dnsbunker.org/wildcard/doh-onlydomains.txt",
+        "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/doh-onlydomains.txt"
+      ]
+    },
     "hagezi-multi": {
       "format": "domains",
       "min_domains": 90500,
@@ -50,7 +62,7 @@
       ]
     }
   },
-  "updated_at": "2026-08-15T00:36:10Z",
+  "updated_at": "2026-08-15T03:19:19Z",
   "updated_by": "Zamir Residence Dashboard",
   "version": 1
 }
