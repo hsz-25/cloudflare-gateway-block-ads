@@ -62,6 +62,10 @@ BASE_URL = f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}"
 CHUNK_SIZE = 1000          # domains per Cloudflare list
 PATCH_BATCH = 1000         # domains per single PATCH append/remove call
 MAX_LISTS = 300            # empirically-verified enforced cap on this account
+MAX_ENTRIES = MAX_LISTS * CHUNK_SIZE   # 300,000 — the hard domain ceiling
+                                       # Must equal blocklists.py's MAX_ENTRIES:
+                                       # the app promises a capacity verdict and
+                                       # this script has to honour the same one.
 
 # Don't repack a tier unless it frees at least this many List slots. Compaction
 # costs two PATCH calls per 1,000 domains moved; reclaiming one or two slots
@@ -164,7 +168,9 @@ DEFAULT_CONFIG = {
 # selection that doesn't fit, so reaching this means the upstream lists grew
 # after the selection was made. Failing loudly is correct — silently swapping in
 # a list the user didn't choose would be worse.
-CAPACITY_THRESHOLD = 299_000
+# Retired. The valve used to engage at a 299,000-domain safety margin, which
+# gave up coverage while the real selection still fitted. It now engages only
+# at the true ceiling — see MAX_ENTRIES / MAX_LISTS and resolve_within_capacity.
 
 
 def log(msg):
@@ -754,16 +760,26 @@ def resolve_selection(config, substitutions=None):
 # blocklists only ever grow, so a selection that fits today can stop fitting
 # years later with nobody watching.
 #
-# This used to abort the run and wait for a human. It now downgrades instead:
-# the largest source that declares a `fallback` in blocklists.json is swapped
-# for its smaller variant, and that repeats until the plan fits. Filtering
-# degrades gracefully rather than stopping -- an out-of-date but working
-# blocklist protects the network; a failed sync eventually does not.
+# This used to abort the run and wait for a human. It now degrades instead, on
+# three deliberate rules:
 #
-# Hysteresis: a downgrade is only undone when the full source fits with
-# RESTORE_MARGIN to spare, so a selection sitting near the line cannot flap
-# between variants on alternate nights.
-RESTORE_MARGIN = 15_000
+#   LAST MOMENT ONLY. The valve engages only when the plan genuinely will not
+#   fit -- more than MAX_LISTS lists, or more than MAX_ENTRIES domains. There is
+#   no early safety margin, so nothing is ever given up while the real thing
+#   still fits.
+#
+#   LEAST COMPROMISE. Every possible single downgrade is costed against the real
+#   downloaded sets, and the CHEAPEST one that fits wins -- not the biggest
+#   list. Dropping Pro to Pro Mini to save 160k domains when swapping a small
+#   list would have saved the needed 2k is a worse outcome, and this avoids it.
+#
+#   ONE AT A TIME. Only if no single swap is enough does it apply the most
+#   effective one and look again, so it never downgrades more lists than the
+#   shortfall actually requires.
+#
+# An out-of-date but working blocklist protects the network; a failed sync
+# eventually does not. Whatever it decides is written to state.json so the
+# dashboards can say so plainly rather than quietly filtering less.
 
 
 def _plan_size(shared, home_only, personal_only, whitelist_count):
@@ -772,8 +788,8 @@ def _plan_size(shared, home_only, personal_only, whitelist_count):
     return total, needed
 
 
-def _fits(total, needed, margin=0):
-    return total + margin < CAPACITY_THRESHOLD and needed <= MAX_LISTS
+def _fits(total, needed):
+    return total <= MAX_ENTRIES and needed <= MAX_LISTS
 
 
 def resolve_within_capacity(config, whitelist_count):
@@ -785,53 +801,65 @@ def resolve_within_capacity(config, whitelist_count):
             if sid not in selected:
                 selected.append(sid)
 
-    substitutions = {}
-    while True:
-        shared, home_only, personal_only = resolve_selection(config, substitutions)
+    def plan(subs):
+        shared, home_only, personal_only = resolve_selection(config, subs)
         total, needed = _plan_size(shared, home_only, personal_only, whitelist_count)
-        log(f"Shared: {len(shared)}  Home-only: {len(home_only)}  Personal-only: {len(personal_only)}  "
-            f"Whitelist: {whitelist_count}")
-        log(f"Combined target: {total} domains in ~{needed} lists "
-            f"(cap {MAX_LISTS * CHUNK_SIZE} domains / {MAX_LISTS} lists)")
-        if _fits(total, needed):
-            if substitutions:
-                for orig, sub in substitutions.items():
-                    log(f"CAPACITY VALVE: using '{specs[sub].get('name', sub)}' in place of "
-                        f"'{specs[orig].get('name', orig)}' to stay within the account cap.")
-            return shared, home_only, personal_only, substitutions
+        return (shared, home_only, personal_only), total, needed
 
-        # Downgrade the biggest not-yet-downgraded source that offers a fallback.
+    substitutions = {}
+    sets, total, needed = plan(substitutions)
+    log(f"Combined target: {total} domains in ~{needed} lists "
+        f"(cap {MAX_ENTRIES} domains / {MAX_LISTS} lists)")
+    if _fits(total, needed):
+        return (*sets, substitutions)
+
+    log(f"OVER CAPACITY by {max(0, total - MAX_ENTRIES)} domains / "
+        f"{max(0, needed - MAX_LISTS)} lists — looking for the smallest swap that fixes it.")
+
+    while True:
         candidates = []
         for sid in selected:
             if sid in substitutions:
                 continue
             fb = specs.get(sid, {}).get("fallback")
             if fb and fb in specs:
-                candidates.append((specs[sid].get("min_domains") or 0, sid, fb))
+                candidates.append((sid, fb))
         if not candidates:
-            die(f"This selection needs {total} domains across ~{needed} lists, at or above the "
-                f"{CAPACITY_THRESHOLD}-domain safety threshold, and no selected source declares a "
-                f"smaller `fallback` variant to swap in. Nothing has been changed. Pick a smaller "
-                f"combination in the dashboard, or add a \"fallback\" to a source in {CONFIG_FILE}.")
-        _, sid, fb = max(candidates)
-        log(f"Over capacity — swapping '{sid}' for its smaller variant '{fb}' and re-planning.")
-        substitutions[sid] = fb
+            die(f"This selection needs {total} domains across ~{needed} lists, beyond the "
+                f"{MAX_ENTRIES}-domain / {MAX_LISTS}-list account cap, and no remaining source "
+                f"declares a smaller `fallback` to swap in. Nothing has been changed. Pick a "
+                f"smaller combination in the dashboard.")
 
+        # Cost every candidate against the real sets. Downloads are cached per
+        # run, so this is one fetch per distinct fallback, not per iteration.
+        scored = []
+        for sid, fb in candidates:
+            trial = dict(substitutions, **{sid: fb})
+            try:
+                t_sets, t_total, t_needed = plan(trial)
+            except SystemExit:
+                continue  # a fallback that won't download is simply not a candidate
+            scored.append({"sid": sid, "fb": fb, "subs": trial, "sets": t_sets,
+                           "total": t_total, "needed": t_needed,
+                           "given_up": total - t_total})
+        if not scored:
+            die("Every capacity fallback failed to download. Nothing has been changed.")
 
-def restore_downgrades(config, substitutions, whitelist_count):
-    """Undo any downgrade whose full source now fits again with room to spare."""
-    specs = config["sources"]
-    for orig in sorted(substitutions, key=lambda k: specs.get(k, {}).get("min_domains") or 0):
-        trial = {k: v for k, v in substitutions.items() if k != orig}
-        try:
-            shared, home_only, personal_only = resolve_selection(config, trial)
-        except SystemExit:
-            continue
-        total, needed = _plan_size(shared, home_only, personal_only, whitelist_count)
-        if _fits(total, needed, margin=RESTORE_MARGIN):
-            log(f"CAPACITY VALVE: '{orig}' fits again with room to spare — restoring it.")
-            return trial
-    return substitutions
+        fitting = [c for c in scored if _fits(c["total"], c["needed"])]
+        if fitting:
+            # Least compromise: of the swaps that work, the one that gives up
+            # the fewest domains.
+            best = min(fitting, key=lambda c: c["given_up"])
+            log(f"CAPACITY VALVE: swapped '{specs[best['sid']].get('name', best['sid'])}' for "
+                f"'{specs[best['fb']].get('name', best['fb'])}' — the smallest change that fits "
+                f"({best['given_up']} domains given up; now {best['total']} in ~{best['needed']} lists).")
+            return (*best["sets"], best["subs"])
+
+        # Nothing fits alone: take the biggest reduction and reassess.
+        best = max(scored, key=lambda c: c["given_up"])
+        log(f"Still over after swapping '{best['sid']}' alone; applying it "
+            f"(-{best['given_up']} domains) and looking again.")
+        substitutions, sets, total, needed = best["subs"], best["sets"], best["total"], best["needed"]
 
 
 def main():
@@ -936,6 +964,19 @@ def main():
         "domains": {"shared": len(shared), "home_only": len(home_only),
                     "personal_only": len(personal_only)},
         "synced_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        # What the capacity valve had to give up, if anything. Written every run
+        # (empty when nothing was swapped) so the dashboards can clear the banner
+        # by themselves the moment a downgrade is no longer in force -- a field
+        # that only appeared on downgrade would leave a stale warning up forever.
+        "downgraded": [
+            {
+                "source": orig,
+                "source_name": config["sources"].get(orig, {}).get("name", orig),
+                "using": sub,
+                "using_name": config["sources"].get(sub, {}).get("name", sub),
+            }
+            for orig, sub in sorted(substitutions.items())
+        ],
     }
     save_state(new_state)
 
