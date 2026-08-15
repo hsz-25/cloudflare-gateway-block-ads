@@ -22,7 +22,18 @@
         "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/doh-onlydomains.txt"
       ]
     },
+    "hagezi-light": {
+      "format": "domains",
+      "min_domains": 20328,
+      "name": "Hagezi Light",
+      "urls": [
+        "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/light-onlydomains.txt",
+        "https://hagezi-mirror.dnsbunker.org/wildcard/light-onlydomains.txt",
+        "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/light-onlydomains.txt"
+      ]
+    },
     "hagezi-multi": {
+      "fallback": "hagezi-light",
       "format": "domains",
       "min_domains": 90500,
       "name": "Hagezi Normal",
@@ -43,6 +54,7 @@
       ]
     },
     "hagezi-pro": {
+      "fallback": "hagezi-pro-mini",
       "format": "domains",
       "min_domains": 107061,
       "name": "Hagezi Pro",
@@ -50,6 +62,16 @@
         "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro-onlydomains.txt",
         "https://hagezi-mirror.dnsbunker.org/wildcard/pro-onlydomains.txt",
         "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/pro-onlydomains.txt"
+      ]
+    },
+    "hagezi-pro-mini": {
+      "format": "domains",
+      "min_domains": 26939,
+      "name": "Hagezi Pro Mini",
+      "urls": [
+        "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro.mini-onlydomains.txt",
+        "https://hagezi-mirror.dnsbunker.org/wildcard/pro.mini-onlydomains.txt",
+        "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/pro.mini-onlydomains.txt"
       ]
     },
     "urlhaus": {
