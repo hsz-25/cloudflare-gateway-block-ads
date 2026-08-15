@@ -2,14 +2,12 @@
   "networks": {
     "home": [
       "hagezi-multi",
-      "urlhaus",
-      "hagezi-popupads"
+      "hagezi-popupads",
+      "urlhaus"
     ],
     "personal": [
       "hagezi-pro",
-      "urlhaus",
-      "hagezi-popupads",
-      "hagezi-multi"
+      "urlhaus"
     ]
   },
   "sources": {
@@ -52,7 +50,7 @@
       ]
     }
   },
-  "updated_at": "2026-08-15T00:24:39Z",
+  "updated_at": "2026-08-15T00:36:10Z",
   "updated_by": "Zamir Residence Dashboard",
   "version": 1
 }
