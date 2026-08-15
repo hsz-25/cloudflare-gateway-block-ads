@@ -16,6 +16,7 @@
       "format": "domains",
       "min_domains": 1,
       "name": "Hagezi DoH Bypass",
+      "tier": 0,
       "urls": [
         "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/doh-onlydomains.txt",
         "https://hagezi-mirror.dnsbunker.org/wildcard/doh-onlydomains.txt",
@@ -26,6 +27,7 @@
       "format": "domains",
       "min_domains": 20328,
       "name": "Hagezi Light",
+      "tier": 1,
       "urls": [
         "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/light-onlydomains.txt",
         "https://hagezi-mirror.dnsbunker.org/wildcard/light-onlydomains.txt",
@@ -37,6 +39,7 @@
       "format": "domains",
       "min_domains": 90500,
       "name": "Hagezi Normal",
+      "tier": 2,
       "urls": [
         "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/multi-onlydomains.txt",
         "https://hagezi-mirror.dnsbunker.org/wildcard/multi-onlydomains.txt",
@@ -47,6 +50,7 @@
       "format": "domains",
       "min_domains": 26144,
       "name": "Hagezi Pop-up Ads",
+      "tier": 0,
       "urls": [
         "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/popupads-onlydomains.txt",
         "https://hagezi-mirror.dnsbunker.org/wildcard/popupads-onlydomains.txt",
@@ -58,6 +62,7 @@
       "format": "domains",
       "min_domains": 107061,
       "name": "Hagezi Pro",
+      "tier": 4,
       "urls": [
         "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro-onlydomains.txt",
         "https://hagezi-mirror.dnsbunker.org/wildcard/pro-onlydomains.txt",
@@ -68,6 +73,7 @@
       "format": "domains",
       "min_domains": 26939,
       "name": "Hagezi Pro Mini",
+      "tier": 3,
       "urls": [
         "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro.mini-onlydomains.txt",
         "https://hagezi-mirror.dnsbunker.org/wildcard/pro.mini-onlydomains.txt",
@@ -78,6 +84,7 @@
       "format": "hosts",
       "min_domains": 1,
       "name": "URLhaus",
+      "tier": 1,
       "urls": [
         "https://urlhaus.abuse.ch/downloads/hostfile/"
       ]
