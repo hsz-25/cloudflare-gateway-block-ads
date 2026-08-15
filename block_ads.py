@@ -68,24 +68,50 @@ MAX_LISTS = 300            # empirically-verified enforced cap on this account
 # every run is churn for its own sake, five or more is real headroom.
 COMPACT_MIN_RECLAIM = 5
 
-HOME_LOCATION_IDS = ["3d4d56f8749d41ea97d291ec5faf3de7"]          # eero
+# The house's location, identified by name. Everything else is a personal
+# location. Held as a fallback only -- the ids are DISCOVERED at run time by
+# resolve_location_ids() below, not hardcoded.
+HOME_LOCATION_NAME = "eero"
+HOME_LOCATION_IDS_FALLBACK = ["3d4d56f8749d41ea97d291ec5faf3de7"]
 
-# Every personal DNS location. Each device has its OWN Gateway location -- that
-# is the only thing that distinguishes a Mac query from an iPhone one, because
-# Cloudflare's DNS analytics carries no per-device identity (the dataset exposes
-# locationId and dohSubdomain, but no email/userId/deviceId).
-#
-# CRITICAL: upsert_policy rebuilds the Personal policy's traffic expression from
-# scratch on every run. Any location missing from this list is dropped from the
-# policy on the next sync, and that device silently stops being filtered -- no
-# error, no failed run, it just quietly goes unprotected. Add a location here the
-# moment you create it.
-PERSONAL_LOCATION_IDS = [
-    "64da928fcda94b808adc11b4f036d7dd",  # Hamza's MacBook Pro
-    "9932efe4cf894d76a588ca00b4e08c98",  # Hamza's iPhone
-    "37dbdba0d3ca4288820a0243d7a252c2",  # Hamza's iPad
-    "6b497a05ed454984b33cbf3554ca544b",  # Personal (before split) -- pre-split history
-]
+
+def resolve_location_ids():
+    """(home_ids, personal_ids), read live from Gateway.
+
+    Each personal device has its OWN DNS location -- that is the only thing that
+    distinguishes a Mac query from an iPhone one, because Cloudflare's DNS
+    analytics carries no per-device identity (the dataset exposes locationId and
+    dohSubdomain, but no email/userId/deviceId).
+
+    Discovered rather than hardcoded, because upsert_policy rebuilds each
+    policy's traffic expression from scratch on every run: a location missing
+    here is dropped from the policy on the next sync and that device silently
+    stops being filtered -- no error, no failed run, it just quietly goes
+    unprotected. Reading the live list means a location created later (a new
+    phone, a replacement laptop) is picked up automatically and can never be
+    forgotten.
+
+    Everything that is not the house is treated as personal, which is the
+    fail-CLOSED direction: an unrecognised location gets the stricter policy
+    rather than the lighter one, and the account's default location -- where
+    Gateway sends any query it cannot attribute -- is personal for exactly that
+    reason.
+    """
+    locations = paginate("/gateway/locations")
+    if not locations:
+        # Never return empty: upsert_policy refuses an empty set, so a transient
+        # API failure aborts the run instead of writing a policy matching nothing.
+        log("WARNING: could not read Gateway locations; falling back to the pinned home id.")
+        return HOME_LOCATION_IDS_FALLBACK, []
+    home, personal = [], []
+    for loc in locations:
+        lid = str(loc.get("id", "")).replace("-", "")
+        if not lid:
+            continue
+        (home if str(loc.get("name", "")).strip().lower() == HOME_LOCATION_NAME else personal).append(lid)
+    log(f"Locations: home={len(home)} personal={len(personal)} "
+        f"({', '.join(sorted(str(l.get('name')) for l in locations))})")
+    return home, personal
 
 CONFIG_FILE = "blocklists.json"
 STATE_FILE = "state.json"
@@ -678,19 +704,30 @@ def git(*args):
 
 # ---------------------------------------------------------------------------
 
-def resolve_selection(config):
+def resolve_selection(config, substitutions=None):
     """Download every configured source and partition the result into the three
-    storage tiers. Returns (shared, home_only, personal_only, source_versions)."""
+    storage tiers. Returns (shared, home_only, personal_only).
+
+    `substitutions` maps a source id to the id that should be downloaded in its
+    place -- how the capacity valve swaps a full list for its smaller variant
+    without touching the user's saved selection.
+    """
+    substitutions = substitutions or {}
     networks = config["networks"]
     specs = config["sources"]
+    resolve = lambda sid: substitutions.get(sid, sid)
     wanted = []
     for network in ("home", "personal"):
         for source_id in networks.get(network) or []:
             if source_id not in specs:
                 die(f"{CONFIG_FILE} lists source '{source_id}' for {network} but has no "
                     f"definition for it under \"sources\".")
-            if source_id not in wanted:
-                wanted.append(source_id)
+            actual = resolve(source_id)
+            if actual not in specs:
+                die(f"{CONFIG_FILE} maps '{source_id}' to fallback '{actual}', which has no "
+                    f"definition under \"sources\".")
+            if actual not in wanted:
+                wanted.append(actual)
 
     if not wanted:
         die(f"{CONFIG_FILE} selects no blocklists at all.")
@@ -698,8 +735,9 @@ def resolve_selection(config):
     log("Downloading selected sources...")
     fetched = {sid: download_source(sid, specs[sid]) for sid in wanted}
 
-    home = set().union(*[fetched[s] for s in networks.get("home") or []]) if networks.get("home") else set()
-    personal = (set().union(*[fetched[s] for s in networks.get("personal") or []])
+    home = (set().union(*[fetched[resolve(s)] for s in networks.get("home") or []])
+            if networks.get("home") else set())
+    personal = (set().union(*[fetched[resolve(s)] for s in networks.get("personal") or []])
                 if networks.get("personal") else set())
 
     before = len(home | personal)
@@ -707,6 +745,93 @@ def resolve_selection(config):
     kept = len(shared) + len(home_only) + len(personal_only)
     log(f"Parent collapsing removed {before - kept} redundant subdomain entries ({kept} remain).")
     return shared, home_only, personal_only
+
+
+# ---------------------------------------------------------------------------
+# Capacity valve
+# ---------------------------------------------------------------------------
+# The account holds at most MAX_LISTS lists of CHUNK_SIZE domains. Upstream
+# blocklists only ever grow, so a selection that fits today can stop fitting
+# years later with nobody watching.
+#
+# This used to abort the run and wait for a human. It now downgrades instead:
+# the largest source that declares a `fallback` in blocklists.json is swapped
+# for its smaller variant, and that repeats until the plan fits. Filtering
+# degrades gracefully rather than stopping -- an out-of-date but working
+# blocklist protects the network; a failed sync eventually does not.
+#
+# Hysteresis: a downgrade is only undone when the full source fits with
+# RESTORE_MARGIN to spare, so a selection sitting near the line cannot flap
+# between variants on alternate nights.
+RESTORE_MARGIN = 15_000
+
+
+def _plan_size(shared, home_only, personal_only, whitelist_count):
+    total = len(shared) + len(home_only) + len(personal_only) + whitelist_count
+    needed = sum(-(-len(x) // CHUNK_SIZE) for x in (shared, home_only, personal_only))
+    return total, needed
+
+
+def _fits(total, needed, margin=0):
+    return total + margin < CAPACITY_THRESHOLD and needed <= MAX_LISTS
+
+
+def resolve_within_capacity(config, whitelist_count):
+    """(shared, home_only, personal_only, substitutions) guaranteed to fit."""
+    specs = config["sources"]
+    selected = []
+    for network in ("home", "personal"):
+        for sid in config["networks"].get(network) or []:
+            if sid not in selected:
+                selected.append(sid)
+
+    substitutions = {}
+    while True:
+        shared, home_only, personal_only = resolve_selection(config, substitutions)
+        total, needed = _plan_size(shared, home_only, personal_only, whitelist_count)
+        log(f"Shared: {len(shared)}  Home-only: {len(home_only)}  Personal-only: {len(personal_only)}  "
+            f"Whitelist: {whitelist_count}")
+        log(f"Combined target: {total} domains in ~{needed} lists "
+            f"(cap {MAX_LISTS * CHUNK_SIZE} domains / {MAX_LISTS} lists)")
+        if _fits(total, needed):
+            if substitutions:
+                for orig, sub in substitutions.items():
+                    log(f"CAPACITY VALVE: using '{specs[sub].get('name', sub)}' in place of "
+                        f"'{specs[orig].get('name', orig)}' to stay within the account cap.")
+            return shared, home_only, personal_only, substitutions
+
+        # Downgrade the biggest not-yet-downgraded source that offers a fallback.
+        candidates = []
+        for sid in selected:
+            if sid in substitutions:
+                continue
+            fb = specs.get(sid, {}).get("fallback")
+            if fb and fb in specs:
+                candidates.append((specs[sid].get("min_domains") or 0, sid, fb))
+        if not candidates:
+            die(f"This selection needs {total} domains across ~{needed} lists, at or above the "
+                f"{CAPACITY_THRESHOLD}-domain safety threshold, and no selected source declares a "
+                f"smaller `fallback` variant to swap in. Nothing has been changed. Pick a smaller "
+                f"combination in the dashboard, or add a \"fallback\" to a source in {CONFIG_FILE}.")
+        _, sid, fb = max(candidates)
+        log(f"Over capacity — swapping '{sid}' for its smaller variant '{fb}' and re-planning.")
+        substitutions[sid] = fb
+
+
+def restore_downgrades(config, substitutions, whitelist_count):
+    """Undo any downgrade whose full source now fits again with room to spare."""
+    specs = config["sources"]
+    for orig in sorted(substitutions, key=lambda k: specs.get(k, {}).get("min_domains") or 0):
+        trial = {k: v for k, v in substitutions.items() if k != orig}
+        try:
+            shared, home_only, personal_only = resolve_selection(config, trial)
+        except SystemExit:
+            continue
+        total, needed = _plan_size(shared, home_only, personal_only, whitelist_count)
+        if _fits(total, needed, margin=RESTORE_MARGIN):
+            log(f"CAPACITY VALVE: '{orig}' fits again with room to spare — restoring it.")
+            return trial
+    return substitutions
 
 
 def main():
@@ -719,25 +844,13 @@ def main():
     log(f"Home     -> {', '.join(networks.get('home') or []) or '(none)'}")
     log(f"Personal -> {', '.join(networks.get('personal') or []) or '(none)'}")
 
-    shared, home_only, personal_only = resolve_selection(config)
-
     log("Fetching current Gateway lists...")
     current_lists = paginate("/gateway/lists") if not DRY_RUN or ACCOUNT_ID else []
     whitelist_count = sum(
         l.get("count", 0) for l in current_lists if l["name"].startswith(WHITELIST_PREFIX)
     )
 
-    total = len(shared) + len(home_only) + len(personal_only) + whitelist_count
-    needed_lists = sum(-(-len(s) // CHUNK_SIZE) for s in (shared, home_only, personal_only))
-    log(f"Shared: {len(shared)}  Home-only: {len(home_only)}  Personal-only: {len(personal_only)}  "
-        f"Whitelist: {whitelist_count}")
-    log(f"Combined target: {total} domains in ~{needed_lists} lists "
-        f"(cap {MAX_LISTS * CHUNK_SIZE} domains / {MAX_LISTS} lists)")
-
-    if total >= CAPACITY_THRESHOLD or needed_lists > MAX_LISTS:
-        die(f"This selection needs {total} domains across ~{needed_lists} lists, at or above the "
-            f"{CAPACITY_THRESHOLD}-domain safety threshold. Nothing has been changed. Pick a "
-            f"smaller combination in the dashboard — the sources have grown since it was chosen.")
+    shared, home_only, personal_only, substitutions = resolve_within_capacity(config, whitelist_count)
 
     if DRY_RUN:
         log("\n[dry-run] Plan is valid and fits. No Cloudflare changes were made.")
@@ -804,9 +917,10 @@ def main():
         tier_ids[prefix] = kept
         tier_empty.extend(empty)
 
-    upsert_policy("Home", HOME_LOCATION_IDS,
+    home_location_ids, personal_location_ids = resolve_location_ids()
+    upsert_policy("Home", home_location_ids,
                   tier_ids[SHARED_PREFIX] + tier_ids[HOME_PREFIX], current_policies)
-    upsert_policy("Personal", PERSONAL_LOCATION_IDS,
+    upsert_policy("Personal", personal_location_ids,
                   tier_ids[SHARED_PREFIX] + tier_ids[PERSONAL_PREFIX], current_policies)
 
     # Only now that no policy references them: drop empty and retired lists.
