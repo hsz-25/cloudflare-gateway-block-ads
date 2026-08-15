@@ -780,9 +780,22 @@ def resolve_selection(config, substitutions=None):
 #   candidate and look again, so it never downgrades more lists than the
 #   shortfall actually requires.
 #
+#   NEVER INVENT A SUBSTITUTE. Only a source that declares a real `fallback` in
+#   blocklists.json is ever swapped. A big list with no smaller published
+#   variant (1Hosts Lite, AdGuard DNS, StevenBlack, Phishing Army and the rest)
+#   is left completely alone and something else is reduced instead -- but that
+#   is recorded as an alert, because it means the list actually pinning the
+#   account against the ceiling is one only you can change.
+#
 # An out-of-date but working blocklist protects the network; a failed sync
 # eventually does not. Whatever it decides is written to state.json so the
 # dashboards can say so plainly rather than quietly filtering less.
+
+
+# A list with no smaller variant is only worth naming as a capacity problem
+# if it is actually big. min_domains is roughly half a source's real size,
+# so this flags anything from ~50k domains upward.
+UNREDUCIBLE_ALERT_FLOOR = 25_000
 
 
 def _plan_size(shared, home_only, personal_only, whitelist_count):
@@ -809,12 +822,27 @@ def resolve_within_capacity(config, whitelist_count):
         total, needed = _plan_size(shared, home_only, personal_only, whitelist_count)
         return (shared, home_only, personal_only), total, needed
 
+    # Selected sources that cannot be reduced at all, biggest first. These are
+    # the ones that pin the account against the ceiling, and the only fix is a
+    # human choosing a different list, so they are surfaced rather than absorbed.
+    def unreducible():
+        out = []
+        for sid in selected:
+            spec = specs.get(sid, {})
+            if spec.get("fallback") and spec["fallback"] in specs:
+                continue
+            out.append({"source": sid,
+                        "name": spec.get("name", sid),
+                        "tier": spec.get("tier", 0),
+                        "min_domains": spec.get("min_domains", 0)})
+        return sorted(out, key=lambda e: -e["min_domains"])
+
     substitutions = {}
     sets, total, needed = plan(substitutions)
     log(f"Combined target: {total} domains in ~{needed} lists "
         f"(cap {MAX_ENTRIES} domains / {MAX_LISTS} lists)")
     if _fits(total, needed):
-        return (*sets, substitutions)
+        return (*sets, substitutions, [])
 
     log(f"OVER CAPACITY by {max(0, total - MAX_ENTRIES)} domains / "
         f"{max(0, needed - MAX_LISTS)} lists — looking for the smallest swap that fixes it.")
@@ -828,10 +856,12 @@ def resolve_within_capacity(config, whitelist_count):
             if fb and fb in specs:
                 candidates.append((sid, fb))
         if not candidates:
+            stuck = ", ".join(f"{e['name']} (~{e['min_domains']}+)" for e in unreducible()[:3])
             die(f"This selection needs {total} domains across ~{needed} lists, beyond the "
-                f"{MAX_ENTRIES}-domain / {MAX_LISTS}-list account cap, and no remaining source "
-                f"declares a smaller `fallback` to swap in. Nothing has been changed. Pick a "
-                f"smaller combination in the dashboard.")
+                f"{MAX_ENTRIES}-domain / {MAX_LISTS}-list account cap, and nothing left in it "
+                f"publishes a smaller variant to swap in. Nothing has been changed. "
+                f"The lists holding it over: {stuck or 'unknown'}. Pick a smaller combination "
+                f"in the dashboard.")
 
         # Cost every candidate against the real sets. Downloads are cached per
         # run, so this is one fetch per distinct fallback, not per iteration.
@@ -861,7 +891,17 @@ def resolve_within_capacity(config, whitelist_count):
                 f"'{specs[best['fb']].get('name', best['fb'])}' — the most aggressive list that "
                 f"fixes it ({best['given_up']} domains given up; now {best['total']} in "
                 f"~{best['needed']} lists).")
-            return (*best["sets"], best["subs"])
+            # Every substantial list that could NOT be reduced. Reported
+            # whenever the valve fires, regardless of tier: a big unreducible
+            # list is the real constraint even when something more aggressive
+            # happened to be swappable, and it is the only thing a human can
+            # act on. Small lists are omitted — naming URLhaus (367 domains) as
+            # a capacity problem would be noise.
+            blockers = [e for e in unreducible() if e["min_domains"] >= UNREDUCIBLE_ALERT_FLOOR]
+            for e in blockers:
+                log(f"NOTE: '{e['name']}' is at least as aggressive but publishes no smaller "
+                    f"variant, so it was left untouched. Switching it would free the most room.")
+            return (*best["sets"], best["subs"], blockers)
 
         # Nothing fits alone: apply the highest-tier candidate and reassess.
         best = max(scored, key=rank)
@@ -886,7 +926,7 @@ def main():
         l.get("count", 0) for l in current_lists if l["name"].startswith(WHITELIST_PREFIX)
     )
 
-    shared, home_only, personal_only, substitutions = resolve_within_capacity(config, whitelist_count)
+    shared, home_only, personal_only, substitutions, capacity_blockers = resolve_within_capacity(config, whitelist_count)
 
     if DRY_RUN:
         log("\n[dry-run] Plan is valid and fits. No Cloudflare changes were made.")
@@ -985,6 +1025,11 @@ def main():
             }
             for orig, sub in sorted(substitutions.items())
         ],
+        # Lists that are at least as aggressive as whatever got downgraded but
+        # publish no smaller variant, so the valve could not touch them. These
+        # are the ones actually holding the account against the ceiling, and
+        # only a human can swap them out. Written every run, so it self-clears.
+        "capacity_blockers": capacity_blockers,
     }
     save_state(new_state)
 
