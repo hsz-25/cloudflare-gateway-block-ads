@@ -1,0 +1,46 @@
+{
+  "networks": {
+    "home": [
+      "hagezi-multi",
+      "urlhaus"
+    ],
+    "personal": [
+      "hagezi-multi",
+      "hagezi-pro",
+      "urlhaus"
+    ]
+  },
+  "sources": {
+    "hagezi-multi": {
+      "format": "domains",
+      "min_domains": 90500,
+      "name": "Hagezi Normal",
+      "urls": [
+        "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/multi-onlydomains.txt",
+        "https://hagezi-mirror.dnsbunker.org/wildcard/multi-onlydomains.txt",
+        "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/multi-onlydomains.txt"
+      ]
+    },
+    "hagezi-pro": {
+      "format": "domains",
+      "min_domains": 107061,
+      "name": "Hagezi Pro",
+      "urls": [
+        "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro-onlydomains.txt",
+        "https://hagezi-mirror.dnsbunker.org/wildcard/pro-onlydomains.txt",
+        "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/pro-onlydomains.txt"
+      ]
+    },
+    "urlhaus": {
+      "format": "hosts",
+      "min_domains": 183,
+      "name": "URLhaus",
+      "urls": [
+        "https://urlhaus.abuse.ch/downloads/hostfile/"
+      ]
+    }
+  },
+  "updated_at": "2026-08-15T00:17:44Z",
+  "updated_by": "Zamir Residence Dashboard",
+  "version": 1
+}
