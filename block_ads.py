@@ -68,8 +68,24 @@ MAX_LISTS = 300            # empirically-verified enforced cap on this account
 # every run is churn for its own sake, five or more is real headroom.
 COMPACT_MIN_RECLAIM = 5
 
-HOME_LOCATION_ID = "3d4d56f8749d41ea97d291ec5faf3de7"
-PERSONAL_LOCATION_ID = "6b497a05ed454984b33cbf3554ca544b"
+HOME_LOCATION_IDS = ["3d4d56f8749d41ea97d291ec5faf3de7"]          # eero
+
+# Every personal DNS location. Each device has its OWN Gateway location -- that
+# is the only thing that distinguishes a Mac query from an iPhone one, because
+# Cloudflare's DNS analytics carries no per-device identity (the dataset exposes
+# locationId and dohSubdomain, but no email/userId/deviceId).
+#
+# CRITICAL: upsert_policy rebuilds the Personal policy's traffic expression from
+# scratch on every run. Any location missing from this list is dropped from the
+# policy on the next sync, and that device silently stops being filtered -- no
+# error, no failed run, it just quietly goes unprotected. Add a location here the
+# moment you create it.
+PERSONAL_LOCATION_IDS = [
+    "64da928fcda94b808adc11b4f036d7dd",  # Hamza's MacBook Pro
+    "9932efe4cf894d76a588ca00b4e08c98",  # Hamza's iPhone
+    "37dbdba0d3ca4288820a0243d7a252c2",  # Hamza's iPad
+    "6b497a05ed454984b33cbf3554ca544b",  # Personal (before split) -- pre-split history
+]
 
 CONFIG_FILE = "blocklists.json"
 STATE_FILE = "state.json"
@@ -623,16 +639,22 @@ def sync_list_set(prefix, target_domains, existing_lists, budget):
 # filter the query log by policyName, so buried inside Home/Personal they became
 # unretrievable. This function fully rebuilds Home/Personal's traffic each run,
 # so anything added here would be wiped every sync anyway.
-def build_traffic(location_id, list_ids):
+def build_traffic(location_ids, list_ids):
     clauses = " or ".join(f"any(dns.domains[*] in ${lid})" for lid in list_ids)
-    return f'dns.location in {{"{location_id}"}} and ({clauses})'
+    locations = " ".join(f'"{lid}"' for lid in location_ids)
+    return f'dns.location in {{{locations}}} and ({clauses})'
 
 
-def upsert_policy(name, location_id, list_ids, current_policies):
+def upsert_policy(name, location_ids, list_ids, current_policies):
     if not list_ids:
         log(f"Skipping policy {name} — its selection resolved to no lists.")
         return
-    traffic = build_traffic(location_id, list_ids)
+    # Refuse rather than write a policy covering nothing: an empty location set
+    # produces `dns.location in {}`, which matches no query at all and would
+    # disable this policy account-wide without failing the run.
+    if not location_ids:
+        raise SystemExit(f"Policy {name} has no location ids configured — refusing to write a policy that matches nothing.")
+    traffic = build_traffic(location_ids, list_ids)
     existing = next((r for r in current_policies if r["name"] == name), None)
     payload = {
         "name": name,
@@ -782,9 +804,9 @@ def main():
         tier_ids[prefix] = kept
         tier_empty.extend(empty)
 
-    upsert_policy("Home", HOME_LOCATION_ID,
+    upsert_policy("Home", HOME_LOCATION_IDS,
                   tier_ids[SHARED_PREFIX] + tier_ids[HOME_PREFIX], current_policies)
-    upsert_policy("Personal", PERSONAL_LOCATION_ID,
+    upsert_policy("Personal", PERSONAL_LOCATION_IDS,
                   tier_ids[SHARED_PREFIX] + tier_ids[PERSONAL_PREFIX], current_policies)
 
     # Only now that no policy references them: drop empty and retired lists.
