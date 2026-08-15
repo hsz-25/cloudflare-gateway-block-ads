@@ -416,8 +416,18 @@ def migrate_prefixes(current_lists):
     log(f"Migrating {len(renames)} lists from the old naming scheme to the three-tier scheme...")
     failed = []
     for lst, new_name in renames:
-        if api("PATCH", f"/gateway/lists/{lst['id']}", {"name": new_name}, fatal=False) is None:
-            failed.append(lst["name"])
+        # PUT, not PATCH. Cloudflare's Gateway-list PATCH is for items only: it
+        # accepts a "name" field, answers success=true, and silently ignores it
+        # (verified live — 228 lists reported renamed, zero actually were). PUT
+        # with {name, type} does rename, and leaves the items untouched
+        # (verified on a throwaway list: both items survived).
+        resp = api("PUT", f"/gateway/lists/{lst['id']}", {"name": new_name, "type": "DOMAIN"}, fatal=False)
+        got = ((resp or {}).get("result") or {}).get("name")
+        if got != new_name:
+            # Never trust the call — confirm the server echoed the new name.
+            # Believing an ignored rename is exactly how the first attempt
+            # produced a log full of successes and an unchanged account.
+            failed.append(f"{lst['name']} (server said {got!r})")
             continue
         lst["name"] = new_name
     if failed:
@@ -801,6 +811,12 @@ def main():
     result = subprocess.run(["git", "diff", "--staged", "--quiet"])
     if result.returncode != 0:
         git("commit", "-m", "Update sync state")
+        # Rebase before pushing. The dashboard commits blocklists.json to this
+        # same branch, so a selection saved while a sync is in flight makes the
+        # push non-fast-forward and state.json silently fails to persist — which
+        # then makes the next run redo everything and the app report a sync
+        # script that looks out of date. Observed on the first real run.
+        subprocess.run(["git", "pull", "--rebase", "origin", "main"], capture_output=True, text=True)
         push = subprocess.run(["git", "push", "origin", "main"], capture_output=True, text=True)
         if push.returncode != 0:
             log(f"Warning: git push failed (change-detection won't persist for the next run, but "
