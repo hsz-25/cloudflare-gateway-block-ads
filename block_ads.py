@@ -1,72 +1,51 @@
 #!/usr/bin/env python3
 """
-Home + Personal Cloudflare Gateway blocklist sync.
+Home + Personal Cloudflare Gateway blocklist sync — config driven.
 
-Sources:
-  Fetched from the first working mirror in HAGEZI_MIRRORS (see that constant - the
-  upstream GitHub account going away once took this sync down for days):
-  - Hagezi Normal      (ads, affiliate, tracking, metrics, telemetry, phishing, malware...)
-  - Hagezi Pro "delta" (only the domains in Hagezi Pro that are NOT already in Hagezi
-                         Normal - Pro is a superset of Normal, so we avoid paying for the
-                         same domain twice across two sets of Lists)
+WHAT CHANGED FROM THE PREVIOUS VERSION
+--------------------------------------
+The sources used to be hardcoded: Home got Hagezi Normal, Personal got Hagezi
+Normal plus a Hagezi Pro "delta". They are now read from blocklists.json in this
+repo, which the Zamir Residence Dashboard commits when you pick lists in the
+app. Everything else about how the sync behaves is deliberately unchanged — the
+in-place diff/PATCH strategy, the compaction pass, the 300-list budget guard and
+the mirror fallbacks all work exactly as before, because those are the parts
+that keep the house protected while a run is in flight.
 
-Sharing:
-  - The Hagezi Normal lists are shared by BOTH the Home and Personal policies.
-  - The Hagezi Pro delta lists are used ONLY by the Personal policy, making Personal
-    effectively equivalent to full Hagezi Pro, without duplicating the domains Normal
-    and Pro share.
+If blocklists.json is missing or unreadable this falls back to the old hardcoded
+pairing, so the repo keeps working untouched.
 
-Update strategy (this is the important part):
-  Cloudflare's free-tier account is capped at ~300 Gateway Lists. Home+Personal together
-  need on the order of 150-200 lists just for one "generation" of Normal+Delta, so there
-  is NOT enough headroom to build a whole second generation of lists next to the old one
-  and swap atomically (this is what silently broke every previous version of this script -
-  it kept hitting Cloudflare's error 2017 "Maximum number of lists reached" mid-run).
+HOW THE TWO NETWORKS SHARE STORAGE
+----------------------------------
+Cloudflare charges per domain stored, not per policy that references it, so the
+domains both networks block are stored once and referenced twice. Every run
+partitions the combined selection into three tiers:
 
-  Instead of delete-everything-then-recreate (which works, but blocks NO ads for the
-  minutes it takes to rebuild - a real outage every single run) or
-  create-everything-then-delete-old (which needs 2x list capacity - doesn't fit here),
-  this script does an in-place diff/PATCH sync, same approach used by
-  github.com/SeriousHoax/Cloudflare-Gateway-Adblock-Updater:
+    shared         — -> both the Home and Personal policies
+    home-only      — -> the Home policy
+    personal-only  — -> the Personal policy
 
-    1. Fetch the domains currently sitting in "our" lists (by name prefix).
-    2. Diff against the freshly downloaded blocklist -> domains to add, domains to remove.
-    3. PATCH existing lists in place (append/remove) instead of recreating them.
-    4. Only create brand new lists for whatever doesn't fit in existing ones.
-    5. Repoint the Home/Personal policies at the current full set of list IDs.
-    6. Only THEN delete any list that ended up empty, plus any list from a fully
-       retired naming scheme (old OISD / Hagezi-Light lists from earlier iterations
-       of this project) - safe now that nothing references them anymore.
+Under the previous hardcoded setup that partition came out as exactly
+"Hagezi Normal" and "Hagezi Pro delta" with nothing home-only, which is why the
+existing Lists map onto the new scheme with no churn. See migrate_prefixes().
 
-  Net effect: no gap in ad-blocking coverage during a routine run, and no need to ever
-  hold two generations of lists in the account at once.
+PARENT COLLAPSING
+-----------------
+Gateway blocks a listed domain and every subdomain beneath it, so an entry whose
+parent is already covered is dead weight. This is applied WITHIN a network's own
+set, and to drop from a network's private tier anything the shared tier already
+covers — never across the two networks, which would silently unprotect whichever
+network doesn't own the parent. See partition().
 
-  A small state file (state.json, committed back to the repo) hashes the last-synced
-  source files so unchanged blocklists skip all Cloudflare API calls entirely.
-
-Capacity safety valve:
-  If Normal+Delta ever approaches Cloudflare's real 300,000-domain / 300-list cap, this
-  script automatically and permanently switches the Personal policy's second source from
-  full Hagezi Pro to the smaller, curated Hagezi Pro Mini list (still layered on top of
-  Normal), so the account never runs out of room without anyone having to intervene. See
-  CAPACITY_DOWNGRADE_THRESHOLD below.
-
-Scheduling:
-  The workflow's cron is aimed at ~5 AM Central (two UTC entries bracket the DST
-  transition), but GitHub Actions schedule triggers are best-effort and can fire
-  significantly late under load - observed in practice firing over 5 hours after
-  the configured time. An earlier version of this script enforced a strict "only
-  do real work if it's actually 5:00-5:29 AM Central right now" window and
-  skipped everything otherwise; that made the sync silently no-op on any day
-  GitHub delayed the trigger past the window, which defeats the entire point of
-  having a nightly sync. There is no time-of-day gate anymore: every scheduled
-  trigger does real work, whenever it actually fires. Two cron entries still
-  exist so there are two chances per day for GitHub to actually run it near the
-  intended time, but neither is ever skipped for being "too late."
+Usage:
+    python3 block_ads.py              # normal run
+    python3 block_ads.py --dry-run    # download, plan, print — touches nothing
+    python3 block_ads.py --audit      # read-only inventory
 """
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -74,94 +53,76 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
-API_TOKEN = os.environ["API_TOKEN"]
-ACCOUNT_ID = os.environ["ACCOUNT_ID"]
+DRY_RUN = "--dry-run" in sys.argv
+
+API_TOKEN = os.environ.get("API_TOKEN", "")
+ACCOUNT_ID = os.environ.get("ACCOUNT_ID", "")
 BASE_URL = f"https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}"
 
 CHUNK_SIZE = 1000          # domains per Cloudflare list
 PATCH_BATCH = 1000         # domains per single PATCH append/remove call
 MAX_LISTS = 300            # empirically-verified enforced cap on this account
 
-# Don't bother repacking a tier unless doing so frees at least this many List
-# slots. Compaction costs two PATCH calls per 1,000 domains moved, so reclaiming
-# one or two slots every run is churn for its own sake; reclaiming five or more
-# is real headroom. See compact_lists().
+# Don't repack a tier unless it frees at least this many List slots. Compaction
+# costs two PATCH calls per 1,000 domains moved; reclaiming one or two slots
+# every run is churn for its own sake, five or more is real headroom.
 COMPACT_MIN_RECLAIM = 5
 
 HOME_LOCATION_ID = "3d4d56f8749d41ea97d291ec5faf3de7"
 PERSONAL_LOCATION_ID = "6b497a05ed454984b33cbf3554ca544b"
 
-HAGEZI_NORMAL_FILE = "multi-onlydomains.txt"
-HAGEZI_PRO_FILE = "pro-onlydomains.txt"
-HAGEZI_PRO_MINI_FILE = "pro.mini-onlydomains.txt"
+CONFIG_FILE = "blocklists.json"
+STATE_FILE = "state.json"
 
-# Where to fetch the Hagezi lists from, in priority order. This used to be a single
-# hardcoded raw.githubusercontent.com URL, which is what broke every run from
-# 2026-08-09 onward: the whole github.com/hagezi ACCOUNT was locked, so all three
-# source URLs started returning 404, download_domains() raised, and the job exited 1.
-# Nothing was wrong with Cloudflare or with this script's sync logic - the source
-# just vanished. Each mirror below is tried in order and the first one that returns
-# a plausible list wins:
-#   1. raw.githubusercontent - the canonical source. Kept FIRST so that the moment
-#      hagezi's account is restored, the sync silently goes back to upstream with no
-#      code change needed. Costs one wasted 404 per file per run while it's down.
-#   2. dnsbunker mirror - community mirror stood up during the lockout, refreshed
-#      daily (verified serving same-day list versions while GitHub was 404ing).
-#   3. jsDelivr @latest - CDN cache of the original repo. It survives the repo being
-#      gone entirely, but it is FROZEN at whatever it last cached (it was still
-#      serving the 2026-08-09 build days later), so it is the last resort, not the
-#      first choice - a stale-but-working blocklist beats no sync at all.
+# The three tiers. SHARED_PREFIX and PERSONAL_PREFIX are the strings the old
+# Normal / ProDelta Lists get renamed to on first run — not new names for new
+# Lists. See migrate_prefixes() for why renaming beats recreating.
+SHARED_PREFIX = "Block ads - Shared"
+HOME_PREFIX = "Block ads - Home"
+PERSONAL_PREFIX = "Block ads - Personal"
+WHITELIST_PREFIX = "Allow - Whitelist"
+
+# What the previous hardcoded version of this script called those two tiers.
+LEGACY_SHARED_PREFIX = "Block ads - Hagezi Normal"
+LEGACY_PERSONAL_PREFIX = "Block ads - Hagezi ProDelta"
+
+MANAGED_PREFIXES = (SHARED_PREFIX, HOME_PREFIX, PERSONAL_PREFIX)
+
 HAGEZI_MIRRORS = [
     "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/",
     "https://hagezi-mirror.dnsbunker.org/wildcard/",
     "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/",
 ]
 
-# Sanity floor per source file. A mirror that answers HTTP 200 with a truncated file,
-# an error page, or a Cloudflare interstitial would otherwise read as "the blocklist
-# legitimately shrank to almost nothing" - and because this script syncs by diffing,
-# it would then dutifully DELETE ~180k domains out of the Gateway lists and leave the
-# house unprotected. Well below the real sizes (~180k / ~215k / ~53k as of Aug 2026)
-# so normal upstream churn never trips it; high enough that no garbage response passes.
-HAGEZI_MIN_DOMAINS = {
-    HAGEZI_NORMAL_FILE: 100_000,
-    HAGEZI_PRO_FILE: 120_000,
-    HAGEZI_PRO_MINI_FILE: 25_000,
+# Used only when blocklists.json is absent — byte-for-byte the behaviour of the
+# version of this script that predates the config file.
+DEFAULT_CONFIG = {
+    "networks": {
+        "home": ["hagezi-multi"],
+        "personal": ["hagezi-pro"],
+    },
+    "sources": {
+        "hagezi-multi": {
+            "name": "Hagezi Normal",
+            "urls": [b + "multi-onlydomains.txt" for b in HAGEZI_MIRRORS],
+            "format": "domains",
+            "min_domains": 100_000,
+        },
+        "hagezi-pro": {
+            "name": "Hagezi Pro",
+            "urls": [b + "pro-onlydomains.txt" for b in HAGEZI_MIRRORS],
+            "format": "domains",
+            "min_domains": 120_000,
+        },
+    },
 }
 
-NORMAL_PREFIX = "Block ads - Hagezi Normal"
-DELTA_PREFIX = "Block ads - Hagezi ProDelta"
-WHITELIST_PREFIX = "Allow - Whitelist"
-
-STATE_FILE = "state.json"
-
-# Real cap is 300 lists x 1,000 entries = 300,000. Once a prospective sync would put
-# Normal+Delta+Whitelist combined at or above this, permanently switch Personal's second
-# source from full Hagezi Pro (~234k domains, ~83k of them not already in Normal) to
-# Hagezi Pro Mini (~72k domains, ~35k not already in Normal) - same *kind* of coverage
-# (ads/trackers/malware/phishing), just a smaller curated set. Switching drops the
-# combined total from ~244k to ~200k in one run, so even a threshold this close to the
-# real cap lands safely once triggered - it's a big one-time drop, not a slow approach to
-# the wall. One-way switch by design: no automatic switching back, so behavior never
-# flaps night to night.
-CAPACITY_DOWNGRADE_THRESHOLD = 299_000
-
-
-def is_retired(name):
-    """
-    True for lists from fully-retired naming schemes used by earlier iterations of this
-    project (plain OISD lists, and bare "Block ads - Hagezi <timestamp> - NNN" lists from
-    the original Hagezi-Light run, which predate the Normal/ProDelta split). These are
-    never referenced once Personal is repointed at the current Normal+Delta list IDs, so
-    they're safe to delete outright rather than diff/patch.
-    """
-    if name.startswith("Block ads - OISD"):
-        return True
-    if name.startswith(NORMAL_PREFIX) or name.startswith(DELTA_PREFIX):
-        return False
-    if name.startswith("Block ads - Hagezi "):
-        return True
-    return False
+# Once a prospective sync would put the account at or above this, stop before
+# changing anything. The real cap is 300,000; the app refuses to commit a
+# selection that doesn't fit, so reaching this means the upstream lists grew
+# after the selection was made. Failing loudly is correct — silently swapping in
+# a list the user didn't choose would be worse.
+CAPACITY_THRESHOLD = 299_000
 
 
 def log(msg):
@@ -173,7 +134,17 @@ def die(msg):
     sys.exit(1)
 
 
+# ---------------------------------------------------------------------------
+# Cloudflare API
+# ---------------------------------------------------------------------------
+
 def api(method, path, data=None, retries=6, fatal=True):
+    if DRY_RUN and method != "GET":
+        log(f"  [dry-run] would {method} {path}"
+            + (f" ({len(data.get('append', data.get('remove', data.get('items', [])))) } items)"
+               if isinstance(data, dict) else ""))
+        return {"result": {"id": "dry-run-id"}}
+
     url = f"{BASE_URL}{path}"
     body = json.dumps(data).encode() if data is not None else None
     last_err = None
@@ -190,9 +161,9 @@ def api(method, path, data=None, retries=6, fatal=True):
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 parsed = json.loads(resp.read())
-            # Cloudflare sometimes returns HTTP 200 with a logical failure in the body
-            # (e.g. rate limiting, transient validation errors) - "result" is null in
-            # that case, which would otherwise blow up callers that expect a list/dict.
+            # Cloudflare sometimes returns HTTP 200 with a logical failure in the
+            # body — "result" is null in that case, which would blow up callers
+            # that expect a list/dict.
             if isinstance(parsed, dict) and parsed.get("success") is False:
                 last_err = f"HTTP 200 but success=false: {json.dumps(parsed.get('errors'))}"
                 time.sleep(min(2 ** attempt, 30))
@@ -226,14 +197,11 @@ def paginate(path, per_page=500):
         resp = api("GET", f"{path}{sep}per_page={per_page}&page={page}")
         batch = (resp or {}).get("result")
         if batch is None:
-            # A well-formed 2xx response with a null/missing "result" (e.g. the resource
-            # was deleted between listing it and fetching it, or a transient API quirk) -
-            # treat as "nothing more here" rather than crashing the whole run.
             log(f"Warning: {path} page {page} returned no result body, treating as empty/last page")
             break
         results.extend(batch)
-        # Cloudflare's result_info exposes total_count, not total_pages - stop once a
-        # page comes back short (fewer than per_page items means it was the last page).
+        # result_info exposes total_count, not total_pages — a short page is the
+        # last page.
         if len(batch) < per_page:
             break
         page += 1
@@ -245,52 +213,145 @@ def chunks(seq, size):
         yield seq[i:i + size]
 
 
-def _fetch_domains_from(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "curl/8"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        text = resp.read().decode()
-    domains = set()
+# ---------------------------------------------------------------------------
+# Sources
+# ---------------------------------------------------------------------------
+#
+# Parsing must stay in lockstep with backend/blocklists.py's parse_domains in
+# the dashboard repo — the app plans capacity with its parser and this script
+# builds the Lists with this one, so a disagreement shows up as the app
+# promising a fit that doesn't materialise.
+
+_HOSTS_RE = re.compile(r"^(?:0\.0\.0\.0|127\.0\.0\.1|::1?)\s+(\S+)")
+_ADBLOCK_RE = re.compile(r"^\|\|([a-z0-9.\-_*]+)\^(?:\$[a-z,~=|.\-]+)?$", re.I)
+_DOMAIN_RE = re.compile(r"^(?!-)[a-z0-9\-_]{1,63}(?<!-)(\.(?!-)[a-z0-9\-_]{1,63}(?<!-))+$", re.I)
+_IGNORED_HOSTS = {"localhost", "localhost.localdomain", "local", "broadcasthost", "ip6-localhost",
+                  "ip6-loopback", "ip6-allnodes", "ip6-allrouters", "0.0.0.0"}
+
+
+def parse_domains(text, fmt):
+    out = set()
     version = None
     for line in text.splitlines():
         line = line.strip()
-        if line.startswith("#"):
-            # Hagezi files carry a "# Version: 2026.0811.1825.51" header - worth
-            # logging so a run's output shows how fresh the source actually was.
+        if not line:
+            continue
+        if line[0] in "#![":
             if version is None and line.lower().startswith("# version:"):
                 version = line.split(":", 1)[1].strip()
             continue
-        if line:
-            domains.add(line)
-    return domains, version
+        if fmt == "hosts":
+            m = _HOSTS_RE.match(line)
+            if not m:
+                continue
+            value = m.group(1)
+        elif fmt == "adblock":
+            m = _ADBLOCK_RE.match(line)
+            if not m:
+                continue
+            value = m.group(1)
+        else:
+            value = line.split()[0]
+        value = value.strip().lower().rstrip(".")
+        if value.startswith("*."):
+            value = value[2:]
+        if not value or value in _IGNORED_HOSTS or not _DOMAIN_RE.match(value):
+            continue
+        out.add(value)
+    return out, version
 
 
-def download_domains(filename, retries=3):
+def download_source(source_id, spec, retries=3):
+    """Fetch one configured source from the first mirror clearing its floor.
+
+    The floor exists for a specific failure mode: a mirror answering HTTP 200
+    with an error page parses as a nearly-empty list, and because this script
+    syncs by diffing it would then dutifully DELETE the real domains out of
+    Cloudflare and leave the house unprotected.
     """
-    Download one Hagezi source file, trying each mirror in HAGEZI_MIRRORS until one
-    returns a list that clears its sanity floor. Dies only if EVERY mirror fails -
-    a single dead source (see the HAGEZI_MIRRORS comment) no longer kills the run.
-    """
-    floor = HAGEZI_MIN_DOMAINS[filename]
+    floor = int(spec.get("min_domains") or 1)
+    fmt = spec.get("format", "domains")
     failures = []
-    for base in HAGEZI_MIRRORS:
-        url = f"{base}{filename}"
+    for url in spec.get("urls") or []:
         for attempt in range(retries):
             try:
-                domains, version = _fetch_domains_from(url)
+                req = urllib.request.Request(url, headers={"User-Agent": "curl/8"})
+                with urllib.request.urlopen(req, timeout=90) as resp:
+                    text = resp.read().decode(errors="ignore")
             except Exception as e:
-                # Retry the same mirror a couple of times before writing it off, so a
-                # transient blip doesn't demote us to a staler mirror for the whole run.
                 if attempt < retries - 1:
                     time.sleep(2 ** attempt)
                     continue
                 failures.append(f"{url}: {e}")
                 break
+            domains, version = parse_domains(text, fmt)
             if len(domains) < floor:
                 failures.append(f"{url}: only {len(domains)} domains, below the {floor} sanity floor")
                 break
-            log(f"  {filename}: {len(domains)} domains from {base} (version {version or 'unknown'})")
+            log(f"  {spec.get('name', source_id)}: {len(domains)} domains from {url} "
+                f"(version {version or 'unknown'})")
             return domains
-    die(f"Could not download {filename} from any known mirror:\n  " + "\n  ".join(failures))
+    die(f"Could not download {spec.get('name', source_id)} from any mirror:\n  " + "\n  ".join(failures))
+
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE) as f:
+                cfg = json.load(f)
+            networks = cfg.get("networks") or {}
+            sources = cfg.get("sources") or {}
+            if sources and (networks.get("home") or networks.get("personal")):
+                log(f"Using selection from {CONFIG_FILE} "
+                    f"(updated {cfg.get('updated_at', 'unknown')} by {cfg.get('updated_by', 'unknown')})")
+                return {"networks": networks, "sources": sources}
+            log(f"Warning: {CONFIG_FILE} is present but empty or malformed; using the built-in default.")
+        except Exception as e:
+            log(f"Warning: could not read {CONFIG_FILE} ({e}); using the built-in default.")
+    else:
+        log(f"No {CONFIG_FILE} in the repo yet; using the built-in default selection.")
+    return DEFAULT_CONFIG
+
+
+def is_covered_by(domain, domains):
+    """True when `domains` blocks `domain` — directly or via a parent."""
+    parts = domain.split(".")
+    return any(".".join(parts[i:]) in domains for i in range(len(parts) - 1))
+
+
+def collapse_to_parents(domains):
+    """Drop entries whose parent is also in the SAME set — Gateway already
+    blocks every subdomain of a listed domain, so those buy nothing.
+
+    Only ever applied within one network's set. Collapsing across both networks
+    is wrong: it drops a domain from Home because Personal's list holds its
+    parent, and Home's policy does not reference Personal's lists.
+    """
+    out = set()
+    for domain in domains:
+        parts = domain.split(".")
+        if any(".".join(parts[i:]) in domains for i in range(1, len(parts) - 1)):
+            continue
+        out.add(domain)
+    return out
+
+
+def partition(home, personal):
+    """Three storage tiers. Must match backend/blocklists.py's partition()
+    exactly — the app promises a capacity result from that function and this one
+    has to deliver it.
+
+    Only domains BOTH networks want may be shared; promoting a parent only one
+    network asked for would make the other over-block. A domain is dropped from
+    a network's own tier when the shared tier already covers it, since every
+    network references shared.
+    """
+    home = collapse_to_parents(home)
+    personal = collapse_to_parents(personal)
+    shared = collapse_to_parents(home & personal)
+    home_only = {d for d in home - shared if not is_covered_by(d, shared)}
+    personal_only = {d for d in personal - shared if not is_covered_by(d, shared)}
+    return shared, home_only, personal_only
 
 
 def sha256_of(domains):
@@ -314,14 +375,82 @@ def save_state(state):
         f.write("\n")
 
 
+# ---------------------------------------------------------------------------
+# List maintenance
+# ---------------------------------------------------------------------------
+
+def migrate_prefixes(current_lists):
+    """Rename the old hardcoded-era Lists onto the three-tier scheme, in place.
+
+    The previous version of this script named its Lists after the specific
+    Hagezi tiers it hardcoded. Those names are wrong the moment a different
+    source is selected, but recreating ~225 Lists under new names is not an
+    option: two generations cannot coexist under the 300-list cap, and deleting
+    first means an outage for the minutes it takes to rebuild.
+
+    Cloudflare's list PATCH accepts a name, so the Lists are renamed where they
+    stand. Contents, ids and policy references are all untouched — the policies
+    keep pointing at the same list ids throughout.
+
+    The old tiers map onto the new ones exactly, which is not a coincidence:
+    under the old pairing Home's set was a subset of Personal's, so the
+    partition this script now computes produces "everything Home has" (the old
+    Normal tier) and "what only Personal has" (the old ProDelta tier), with
+    nothing home-only.
+    """
+    # Never let a legacy-named list fall through to the retirement logic. If a
+    # rename fails, the list keeps its old name — and is_retired() would then
+    # classify it as dead weight and DELETE it, taking the domains with it and
+    # rebuilding from scratch. That is a real outage plus a cap risk, from a
+    # single failed PATCH. Abort instead; see the check at the end.
+    renames = []
+    for lst in current_lists:
+        name = lst["name"]
+        if name.startswith(LEGACY_SHARED_PREFIX):
+            renames.append((lst, name.replace(LEGACY_SHARED_PREFIX, SHARED_PREFIX, 1)))
+        elif name.startswith(LEGACY_PERSONAL_PREFIX):
+            renames.append((lst, name.replace(LEGACY_PERSONAL_PREFIX, PERSONAL_PREFIX, 1)))
+    if not renames:
+        return current_lists
+
+    log(f"Migrating {len(renames)} lists from the old naming scheme to the three-tier scheme...")
+    failed = []
+    for lst, new_name in renames:
+        if api("PATCH", f"/gateway/lists/{lst['id']}", {"name": new_name}, fatal=False) is None:
+            failed.append(lst["name"])
+            continue
+        lst["name"] = new_name
+    if failed:
+        die(f"Renamed {len(renames) - len(failed)} of {len(renames)} lists, but {len(failed)} "
+            f"failed (e.g. {failed[0]!r}). Stopping before touching anything else — a "
+            f"half-migrated account would have the still-old-named lists deleted as retired. "
+            f"Re-run to retry; the renames already done are harmless and idempotent.")
+    log("Rename complete — contents and list ids unchanged, policies never dereferenced.")
+    return current_lists
+
+
+def is_retired(name):
+    """True for lists from naming schemes nothing references anymore. These are
+    deleted outright rather than diffed.
+
+    The legacy prefixes are deliberately excluded even though migrate_prefixes()
+    should have renamed them already. If a rename ever fails, treating the
+    survivors as retired would delete live blocklists and rebuild them from
+    empty — so the safe answer is to leave them alone and let the run abort on
+    the list budget instead.
+    """
+    if any(name.startswith(p) for p in MANAGED_PREFIXES):
+        return False
+    if name.startswith((WHITELIST_PREFIX, LEGACY_SHARED_PREFIX, LEGACY_PERSONAL_PREFIX)):
+        return False
+    return name.startswith("Block ads - ")
+
+
 def reclaimable_slots(current_lists):
-    """
-    How many List slots a repack would hand back, per managed tier, using only the
-    `count` field the list endpoint already returns. Cheap enough to check on every
-    run, including runs that would otherwise exit early. See compact_lists().
-    """
+    """How many List slots a repack would hand back, per managed tier, using only
+    the `count` the list endpoint already returns."""
     total = 0
-    for prefix in (NORMAL_PREFIX, DELTA_PREFIX):
+    for prefix in MANAGED_PREFIXES:
         tier = [l for l in current_lists if l["name"].startswith(prefix)]
         if not tier:
             continue
@@ -332,40 +461,20 @@ def reclaimable_slots(current_lists):
 
 
 def compact_lists(prefix, current_map):
-    """
-    Repack a prefix's Lists so the same domains occupy as few Lists as possible.
+    """Repack a tier's Lists so the same domains occupy as few Lists as possible.
 
-    WHY THIS EXISTS
-    ---------------
-    The diff/PATCH sync below never lets a List grow past CHUNK_SIZE, but nothing
-    ever pushed a List back UP toward full once churn had eaten into it, and a List
-    was only ever deleted at exactly zero domains. Every run removes domains
-    scattered across every List and adds a smaller number back, and the add phase
-    only fills existing Lists up to the size of that run's add queue - so the holes
-    punched by removals were never fully backfilled. The result was a one-way
-    ratchet: Lists drifted down toward small-but-nonzero and just sat there.
+    The diff/PATCH sync never lets a List grow past CHUNK_SIZE, but nothing ever
+    pushed a List back up toward full once churn had eaten into it. Every run
+    removes domains scattered across every List and adds a smaller number back,
+    so the holes punched by removals were never fully backfilled — a one-way
+    ratchet toward small-but-nonzero Lists. Observed before this existed: 277 of
+    300 Lists holding 224,261 domains, i.e. an account that looked 92% full
+    while being 75% empty.
 
-    Observed before this function existed: 277 of the 300 allowed Lists holding only
-    224,261 domains. The ProDelta tier was the worst of it - 91 Lists holding 43,493
-    domains, an average of 478 out of a possible 1,000, wasting ~47 List slots on
-    nothing but fragmentation. The account looked 92% full while being 75% empty.
-
-    HOW IT WORKS
-    ------------
-    Sort by fill level, treat the fullest Lists as receivers and the emptiest as
-    donors, then move domains from donors into receivers' free space until the
-    donors are empty. Emptied donors fall out through the existing "delete Lists
-    that ended up empty" step, which already runs after the policies have been
-    repointed - so a List is only ever deleted once nothing references it.
-
-    SAFETY
-    ------
-    Domains are APPENDED to the receiver before being REMOVED from the donor, never
-    the other way around. If a run dies halfway through a move, the domain is in two
-    Lists at once - harmless duplicate blocking that the next run's diff cleans up.
-    The reverse order could leave a domain in neither List, i.e. silently unblocked.
-
-    Returns the number of Lists drained (they will read as empty to the caller).
+    Domains are APPENDED to the receiver before being REMOVED from the donor,
+    never the reverse. A run that dies mid-move leaves a domain in two Lists —
+    harmless duplicate blocking the next diff cleans up. The other order could
+    leave it in neither, i.e. silently unblocked.
     """
     placed = set()
     for domains in current_map.values():
@@ -381,8 +490,6 @@ def compact_lists(prefix, current_map):
     receivers, donors = by_fill[:needed], by_fill[needed:]
     free = sum(CHUNK_SIZE - len(current_map[r]) for r in receivers)
 
-    # Drain the emptiest donors first, and only ones that fit entirely in the
-    # receivers' free space — a partially drained donor reclaims no slot at all.
     drained = []
     used = 0
     for d in sorted(donors, key=lambda lid: len(current_map[lid])):
@@ -399,7 +506,6 @@ def compact_lists(prefix, current_map):
     log(f"[{prefix}] compacting: {len(current_map)} lists hold {len(placed)} domains "
         f"(perfect pack = {needed}); moving {len(moving)} domains to drain {len(drained)} lists.")
 
-    # Append into receivers FIRST — coverage is never interrupted.
     for r in receivers:
         if not moving:
             break
@@ -412,7 +518,6 @@ def compact_lists(prefix, current_map):
             api("PATCH", f"/gateway/lists/{r}", {"append": [{"value": d} for d in batch]})
         current_map[r] |= set(take)
 
-    # ...and only now empty the donors.
     for d in drained:
         for batch in chunks(sorted(current_map[d]), PATCH_BATCH):
             api("PATCH", f"/gateway/lists/{d}", {"remove": batch})
@@ -424,21 +529,16 @@ def compact_lists(prefix, current_map):
 
 
 def sync_list_set(prefix, target_domains, existing_lists, budget):
-    """
-    Diff/PATCH an existing set of Cloudflare Lists (identified by name prefix) so their
-    combined contents equal target_domains, creating new lists only for the overflow
-    that doesn't fit in existing ones.
+    """Diff/PATCH a tier's Lists so their combined contents equal target_domains,
+    creating new Lists only for overflow that doesn't fit in existing ones.
 
-    existing_lists: [{"id":..., "name":...}, ...] already filtered to this prefix.
-    budget: how many brand new lists we're still allowed to create this run (global cap).
-
-    Returns (final_list_ids, empty_list_ids, lists_created, budget_remaining).
+    Returns (kept_ids, empty_ids, lists_created, budget_remaining).
     """
-    current_map = {}  # list_id -> set(domains currently in that list)
+    current_map = {}
     for lst in existing_lists:
         items = paginate(f"/gateway/lists/{lst['id']}/items")
         current_map[lst["id"]] = {i["value"] for i in items}
-        time.sleep(0.05)  # light throttle - avoid bursting hundreds of GETs at once
+        time.sleep(0.05)  # light throttle — avoid bursting hundreds of GETs
 
     all_current = set()
     for domains in current_map.values():
@@ -450,18 +550,16 @@ def sync_list_set(prefix, target_domains, existing_lists, budget):
     log(f"[{prefix}] existing lists: {len(existing_lists)}, current domains: {len(all_current)}, "
         f"target domains: {len(target_domains)}, to add: {len(to_add)}, to remove: {len(to_remove)}")
 
-    # Remove domains that shouldn't be there anymore
     for lst in existing_lists:
         lid = lst["id"]
         remove_here = list(current_map[lid] & to_remove)
         for batch in chunks(remove_here, PATCH_BATCH):
-            # Cloudflare's Patch List endpoint takes `remove` as plain value strings,
-            # but `append` as full {"value": ...} item objects - these are NOT symmetric.
+            # Patch List takes `remove` as plain value strings but `append` as
+            # full {"value": ...} objects — these are NOT symmetric.
             api("PATCH", f"/gateway/lists/{lid}", {"remove": batch})
         if remove_here:
             current_map[lid] -= set(remove_here)
 
-    # Fill freed-up space (and part of the new domains) into existing lists first
     add_queue = list(to_add)
     for lst in existing_lists:
         lid = lst["id"]
@@ -473,13 +571,11 @@ def sync_list_set(prefix, target_domains, existing_lists, budget):
                 api("PATCH", f"/gateway/lists/{lid}", {"append": [{"value": d} for d in batch]})
             current_map[lid] |= set(take)
 
-    # Backfilling above only ever moves domains INTO holes as big as this run's add
-    # queue. Anything left over is long-run fragmentation, so repack it now — before
-    # the new-list creation below, so any slot freed here is a slot that creation can
-    # spend instead of failing against the cap.
+    # Backfilling only moves domains into holes as big as this run's add queue.
+    # Anything left is long-run fragmentation — repack before creating, so a slot
+    # freed here is a slot creation can spend instead of failing against the cap.
     compact_lists(prefix, current_map)
 
-    # Whatever's left needs brand new lists
     final_ids = [lst["id"] for lst in existing_lists]
     lists_created = 0
     next_n = len(existing_lists) + 1
@@ -511,23 +607,21 @@ def sync_list_set(prefix, target_domains, existing_lists, budget):
     return kept_ids, empty_ids, lists_created, budget
 
 
-# Security Threats category blocking and DNS Rebinding Protection are SEPARATE
-# Gateway rules ("Security Threats Block (Home + Personal)" and "DNS Rebinding
-# Protection"), deliberately NOT folded into this ad-block traffic expression.
-# They were briefly folded in to reduce the policy count, but that broke the
-# dashboard's ability to filter for them: Cloudflare's free analytics API can
-# only filter the query log by policyName (not by security-category or resolved
-# IP), and it samples out rare events - so with them buried inside Home/Personal
-# they became unretrievable. Keeping them as their own named rules is what lets
-# the app reliably surface and filter them. This function fully rebuilds
-# Home/Personal's traffic each run, so anything added here would be wiped every
-# sync anyway - another reason those two stay separate.
+# Security Threats and DNS Rebinding Protection are SEPARATE Gateway rules,
+# deliberately not folded into this traffic expression. Folding them in broke the
+# dashboard's ability to filter for them: Cloudflare's free analytics API can only
+# filter the query log by policyName, so buried inside Home/Personal they became
+# unretrievable. This function fully rebuilds Home/Personal's traffic each run,
+# so anything added here would be wiped every sync anyway.
 def build_traffic(location_id, list_ids):
     clauses = " or ".join(f"any(dns.domains[*] in ${lid})" for lid in list_ids)
     return f'dns.location in {{"{location_id}"}} and ({clauses})'
 
 
 def upsert_policy(name, location_id, list_ids, current_policies):
+    if not list_ids:
+        log(f"Skipping policy {name} — its selection resolved to no lists.")
+        return
     traffic = build_traffic(location_id, list_ids)
     existing = next((r for r in current_policies if r["name"] == name), None)
     payload = {
@@ -542,7 +636,7 @@ def upsert_policy(name, location_id, list_ids, current_policies):
         log(f"Creating policy {name}...")
         api("POST", "/gateway/rules", payload)
     else:
-        log(f"Updating policy {name} ({existing['id']})...")
+        log(f"Updating policy {name} ({existing['id']}) -> {len(list_ids)} lists...")
         api("PUT", f"/gateway/rules/{existing['id']}", payload)
 
 
@@ -550,76 +644,91 @@ def git(*args):
     subprocess.run(["git", *args], check=True)
 
 
-def resolve_pro_source(state, whitelist_count):
-    """
-    Decides which Hagezi Pro variant feeds the Personal policy's delta this run, and
-    whether that decision needs to change (the capacity safety valve). Returns
-    (pro_domains, pro_label, mode, downgraded_this_run).
-    """
-    previous_mode = state.get("blocklist_mode", "full_pro")
+# ---------------------------------------------------------------------------
 
-    if previous_mode == "pro_mini":
-        # Already downgraded in an earlier run - one-way switch, stay on Mini.
-        return download_domains(HAGEZI_PRO_MINI_FILE), "Hagezi Pro Mini", "pro_mini", False
+def resolve_selection(config):
+    """Download every configured source and partition the result into the three
+    storage tiers. Returns (shared, home_only, personal_only, source_versions)."""
+    networks = config["networks"]
+    specs = config["sources"]
+    wanted = []
+    for network in ("home", "personal"):
+        for source_id in networks.get(network) or []:
+            if source_id not in specs:
+                die(f"{CONFIG_FILE} lists source '{source_id}' for {network} but has no "
+                    f"definition for it under \"sources\".")
+            if source_id not in wanted:
+                wanted.append(source_id)
 
-    normal_domains = download_domains(HAGEZI_NORMAL_FILE)
-    pro_domains = download_domains(HAGEZI_PRO_FILE)
-    delta_domains = pro_domains - normal_domains
-    prospective_total = len(normal_domains) + len(delta_domains) + whitelist_count
+    if not wanted:
+        die(f"{CONFIG_FILE} selects no blocklists at all.")
 
-    if prospective_total < CAPACITY_DOWNGRADE_THRESHOLD:
-        return pro_domains, "Hagezi Pro", "full_pro", False
+    log("Downloading selected sources...")
+    fetched = {sid: download_source(sid, specs[sid]) for sid in wanted}
 
-    log(f"WARNING: Normal+Delta+Whitelist would be {prospective_total} domains this run, at or "
-        f"above the {CAPACITY_DOWNGRADE_THRESHOLD}-domain safety threshold (Cloudflare's real cap "
-        f"is {MAX_LISTS * CHUNK_SIZE}). Automatically switching the Personal policy's second "
-        f"source from full Hagezi Pro to Hagezi Pro Mini to stay safely under the cap - same kind "
-        f"of ad/tracker/malware/phishing coverage, a smaller curated domain set. This is a "
-        f"one-way, permanent change: Personal keeps using Pro Mini on every future run, it does "
-        f"not automatically switch back even if the list shrinks later.")
-    return download_domains(HAGEZI_PRO_MINI_FILE), "Hagezi Pro Mini", "pro_mini", True
+    home = set().union(*[fetched[s] for s in networks.get("home") or []]) if networks.get("home") else set()
+    personal = (set().union(*[fetched[s] for s in networks.get("personal") or []])
+                if networks.get("personal") else set())
+
+    before = len(home | personal)
+    shared, home_only, personal_only = partition(home, personal)
+    kept = len(shared) + len(home_only) + len(personal_only)
+    log(f"Parent collapsing removed {before - kept} redundant subdomain entries ({kept} remain).")
+    return shared, home_only, personal_only
 
 
 def main():
+    if not DRY_RUN and (not API_TOKEN or not ACCOUNT_ID):
+        die("API_TOKEN and ACCOUNT_ID must be set.")
+
     state = load_state()
+    config = load_config()
+    networks = config["networks"]
+    log(f"Home     -> {', '.join(networks.get('home') or []) or '(none)'}")
+    log(f"Personal -> {', '.join(networks.get('personal') or []) or '(none)'}")
 
-    log("Downloading Hagezi Normal...")
-    normal_domains = download_domains(HAGEZI_NORMAL_FILE)
+    shared, home_only, personal_only = resolve_selection(config)
 
-    log("Fetching current Gateway lists (needed for the capacity check and the sync itself)...")
-    current_lists = paginate("/gateway/lists")
+    log("Fetching current Gateway lists...")
+    current_lists = paginate("/gateway/lists") if not DRY_RUN or ACCOUNT_ID else []
     whitelist_count = sum(
         l.get("count", 0) for l in current_lists if l["name"].startswith(WHITELIST_PREFIX)
     )
 
-    log("Resolving Hagezi Pro source (checking capacity safety valve)...")
-    pro_domains, pro_label, mode, downgraded_this_run = resolve_pro_source(state, whitelist_count)
+    total = len(shared) + len(home_only) + len(personal_only) + whitelist_count
+    needed_lists = sum(-(-len(s) // CHUNK_SIZE) for s in (shared, home_only, personal_only))
+    log(f"Shared: {len(shared)}  Home-only: {len(home_only)}  Personal-only: {len(personal_only)}  "
+        f"Whitelist: {whitelist_count}")
+    log(f"Combined target: {total} domains in ~{needed_lists} lists "
+        f"(cap {MAX_LISTS * CHUNK_SIZE} domains / {MAX_LISTS} lists)")
 
-    delta_domains = pro_domains - normal_domains
-    if not delta_domains:
-        die(f"{pro_label} delta is empty - something is wrong upstream")
+    if total >= CAPACITY_THRESHOLD or needed_lists > MAX_LISTS:
+        die(f"This selection needs {total} domains across ~{needed_lists} lists, at or above the "
+            f"{CAPACITY_THRESHOLD}-domain safety threshold. Nothing has been changed. Pick a "
+            f"smaller combination in the dashboard — the sources have grown since it was chosen.")
 
-    log(f"Hagezi Normal: {len(normal_domains)} domains")
-    log(f"{pro_label} delta ({pro_label} minus Normal): {len(delta_domains)} domains")
-    log(f"Whitelist: {whitelist_count} domains")
-    log(f"Combined Normal+Delta+Whitelist target: "
-        f"{len(normal_domains) + len(delta_domains) + whitelist_count} of "
-        f"{MAX_LISTS * CHUNK_SIZE} max ({mode} mode)")
+    if DRY_RUN:
+        log("\n[dry-run] Plan is valid and fits. No Cloudflare changes were made.")
+        return
 
-    normal_hash = sha256_of(normal_domains)
-    delta_hash = sha256_of(delta_domains)
-    # Reclaimable slots is checked alongside the source hashes because the two go
-    # out of sync: fragmentation is caused by PAST runs, so a day where nothing
-    # changed upstream is exactly the kind of day the old code would skip while
-    # leaving dozens of List slots stranded. Uses the `count` already returned by
-    # the list endpoint, so it costs no extra API calls.
+    current_lists = migrate_prefixes(current_lists)
+
+    tiers = [
+        (SHARED_PREFIX, shared),
+        (HOME_PREFIX, home_only),
+        (PERSONAL_PREFIX, personal_only),
+    ]
+
+    selection_hash = hashlib.sha256(
+        json.dumps(networks, sort_keys=True).encode()).hexdigest()
+    tier_hashes = {prefix: sha256_of(domains) for prefix, domains in tiers}
     reclaimable = reclaimable_slots(current_lists)
-    if (not downgraded_this_run and state.get("normal_sha256") == normal_hash
-            and state.get("delta_sha256") == delta_hash
-            and state.get("blocklist_mode", "full_pro") == mode
+
+    if (state.get("selection_sha256") == selection_hash
+            and state.get("tier_sha256") == tier_hashes
             and reclaimable < COMPACT_MIN_RECLAIM):
-        log("No change in either source since the last successful sync, and the lists are "
-            "well packed. Nothing to do.")
+        log("No change in the selection or any source since the last successful sync, and the "
+            "lists are well packed. Nothing to do.")
         return
     if reclaimable >= COMPACT_MIN_RECLAIM:
         log(f"Lists are fragmented — about {reclaimable} of the {MAX_LISTS} slots are "
@@ -629,96 +738,59 @@ def main():
     rules_resp = api("GET", "/gateway/rules")
     current_policies = rules_resp.get("result") if rules_resp else None
     if current_policies is None:
-        # Unlike list items, getting this wrong is dangerous: if we mistakenly think no
-        # policy exists, upsert_policy() would create a duplicate instead of updating.
+        # Getting this wrong is dangerous: believing no policy exists would make
+        # upsert_policy create a duplicate instead of updating.
         die(f"Fetching current Gateway policies returned no result body: {rules_resp}")
 
-    normal_lists = sorted(
-        (l for l in current_lists if l["name"].startswith(NORMAL_PREFIX)),
-        key=lambda l: l["name"],
-    )
-    delta_lists = sorted(
-        (l for l in current_lists if l["name"].startswith(DELTA_PREFIX)),
-        key=lambda l: l["name"],
-    )
     retired_lists = [l for l in current_lists if is_retired(l["name"])]
-    non_retired_count = len(current_lists) - len(retired_lists)
 
-    # The 300-list cap is enforced on the account's TOTAL list count, regardless of
-    # whether a list is still referenced by a policy - a retired list still occupies a
-    # slot until it's actually deleted. So the real headroom for new creates, as long as
-    # we leave retired lists in place, is measured against the current total, not just
-    # the "active" subset.
+    # The cap counts every list, referenced or not — a retired list occupies a
+    # slot until it is actually deleted.
     budget = max(0, MAX_LISTS - len(current_lists))
-    log(f"Account currently has {len(current_lists)} lists ({len(retired_lists)} retired, "
-        f"{non_retired_count} active); {budget} of headroom before the {MAX_LISTS} cap "
-        f"without touching retired lists.")
+    log(f"Account has {len(current_lists)} lists ({len(retired_lists)} retired); "
+        f"{budget} of headroom before the {MAX_LISTS} cap.")
 
-    # Retired lists still referenced by Personal's *current* traffic can't be deleted
-    # until Personal is repointed away from them (Cloudflare rejects deleting a list
-    # that's in active use by a rule). Anything retired but already unreferenced is dead
-    # weight and safe to drop immediately regardless of budget.
-    personal_policy = next((r for r in current_policies if r["name"] == "Personal"), None)
-    personal_traffic = personal_policy.get("traffic", "") if personal_policy else ""
-    referenced_retired = [l for l in retired_lists if f"${l['id']}" in personal_traffic]
-    orphaned_retired = [l for l in retired_lists if l not in referenced_retired]
-
+    # Retired lists still referenced by a policy can't be deleted until that
+    # policy is repointed (Cloudflare rejects deleting a list in active use).
+    referenced = ""
+    for rule in current_policies:
+        if rule.get("name") in ("Home", "Personal"):
+            referenced += rule.get("traffic", "") or ""
+    orphaned_retired = [l for l in retired_lists if f"${l['id']}" not in referenced]
     if orphaned_retired:
         log(f"Deleting {len(orphaned_retired)} retired lists that are already unreferenced...")
         for l in orphaned_retired:
             api("DELETE", f"/gateway/lists/{l['id']}", fatal=False)
-        budget = max(0, budget + len(orphaned_retired))
-        retired_lists = referenced_retired
+        budget += len(orphaned_retired)
+        retired_lists = [l for l in retired_lists if l not in orphaned_retired]
 
-    # Upper-bound estimate of brand new lists this run could need (ignores free space in
-    # lists we're about to patch, so it's pessimistic - real usage is normally far lower).
-    worst_case_new = (
-        max(0, -(-len(normal_domains) // CHUNK_SIZE) - len(normal_lists))
-        + max(0, -(-len(delta_domains) // CHUNK_SIZE) - len(delta_lists))
-    )
+    tier_ids, tier_empty = {}, []
+    for prefix, domains in tiers:
+        existing = sorted((l for l in current_lists if l["name"].startswith(prefix)),
+                          key=lambda l: l["name"])
+        kept, empty, _created, budget = sync_list_set(prefix, domains, existing, budget)
+        tier_ids[prefix] = kept
+        tier_empty.extend(empty)
 
-    if worst_case_new > budget and referenced_retired:
-        # Repoint Personal at just the Normal lists first - a real, valid, zero-downtime
-        # upgrade over the old OISD/Light setup on its own - which drops the reference to
-        # the remaining retired lists and frees those slots for deletion. Personal gets
-        # upgraded to the full Normal+Delta set a few steps later in this same run.
-        log(f"Estimated worst case of {worst_case_new} new lists needed, only {budget} of "
-            f"headroom available, and {len(referenced_retired)} retired lists are still "
-            f"referenced by Personal's current policy. Repointing Personal at the "
-            f"Normal-only list set first (a real upgrade on its own) to free them.")
-        upsert_policy("Home", HOME_LOCATION_ID,
-                      [l["id"] for l in normal_lists], current_policies)
-        upsert_policy("Personal", PERSONAL_LOCATION_ID,
-                      [l["id"] for l in normal_lists], current_policies)
-        for l in referenced_retired:
-            api("DELETE", f"/gateway/lists/{l['id']}", fatal=False)
-        budget = max(0, MAX_LISTS - non_retired_count)
-        retired_lists = []  # already gone - nothing left to delete again at the end
-        # Refresh our view of "current" policies so the upsert_policy calls below see
-        # Home/Personal as already existing (PUT, not POST).
-        rules_resp = api("GET", "/gateway/rules")
-        current_policies = (rules_resp or {}).get("result") or current_policies
+    upsert_policy("Home", HOME_LOCATION_ID,
+                  tier_ids[SHARED_PREFIX] + tier_ids[HOME_PREFIX], current_policies)
+    upsert_policy("Personal", PERSONAL_LOCATION_ID,
+                  tier_ids[SHARED_PREFIX] + tier_ids[PERSONAL_PREFIX], current_policies)
 
-    normal_ids, normal_empty, normal_created, budget = sync_list_set(
-        NORMAL_PREFIX, normal_domains, normal_lists, budget)
-    delta_ids, delta_empty, delta_created, budget = sync_list_set(
-        DELTA_PREFIX, delta_domains, delta_lists, budget)
-
-    upsert_policy("Home", HOME_LOCATION_ID, normal_ids, current_policies)
-    upsert_policy("Personal", PERSONAL_LOCATION_ID, normal_ids + delta_ids, current_policies)
-
-    # Only now that no policy references them anymore: drop empty lists + any leftover
-    # retired lists (normally already gone via the early-free step above).
-    to_delete = normal_empty + delta_empty + [l["id"] for l in retired_lists]
+    # Only now that no policy references them: drop empty and retired lists.
+    to_delete = tier_empty + [l["id"] for l in retired_lists]
     log(f"Deleting {len(to_delete)} superseded/empty lists...")
     for lid in to_delete:
         api("DELETE", f"/gateway/lists/{lid}", fatal=False)
 
-    new_state = {"normal_sha256": normal_hash, "delta_sha256": delta_hash, "blocklist_mode": mode}
-    if downgraded_this_run:
-        new_state["blocklist_mode_switched_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    elif "blocklist_mode_switched_at" in state:
-        new_state["blocklist_mode_switched_at"] = state["blocklist_mode_switched_at"]
+    new_state = {
+        "selection_sha256": selection_hash,
+        "tier_sha256": tier_hashes,
+        "networks": networks,
+        "domains": {"shared": len(shared), "home_only": len(home_only),
+                    "personal_only": len(personal_only)},
+        "synced_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
     save_state(new_state)
 
     actor = os.environ.get("GITHUB_ACTOR", "github-actions")
@@ -731,9 +803,8 @@ def main():
         git("commit", "-m", "Update sync state")
         push = subprocess.run(["git", "push", "origin", "main"], capture_output=True, text=True)
         if push.returncode != 0:
-            log(f"Warning: git push failed (state.json change-detection won't persist for "
-                f"next run, but the Cloudflare sync above already completed successfully): "
-                f"{push.stderr}")
+            log(f"Warning: git push failed (change-detection won't persist for the next run, but "
+                f"the Cloudflare sync above already completed successfully): {push.stderr}")
         else:
             log("Pushed updated state.json.")
     else:
@@ -743,7 +814,7 @@ def main():
 
 
 def audit():
-    """Read-only inventory of the account's current Gateway lists/policies. Makes no changes."""
+    """Read-only inventory of the account's current Gateway lists/policies."""
     log("Fetching current Gateway policies...")
     for r in (api("GET", "/gateway/rules") or {}).get("result") or []:
         n_lists = r["traffic"].count("any(dns.domains")
@@ -754,21 +825,20 @@ def audit():
     current_lists = paginate("/gateway/lists")
     by_bucket = {}
     for l in current_lists:
-        if l["name"].startswith(NORMAL_PREFIX):
-            bucket = NORMAL_PREFIX
-        elif l["name"].startswith(DELTA_PREFIX):
-            bucket = DELTA_PREFIX
-        elif is_retired(l["name"]):
-            bucket = "retired"
+        bucket = "other"
+        for prefix in MANAGED_PREFIXES + (WHITELIST_PREFIX,):
+            if l["name"].startswith(prefix):
+                bucket = prefix
+                break
         else:
-            bucket = "other"
+            if is_retired(l["name"]):
+                bucket = "retired"
         by_bucket.setdefault(bucket, []).append(l)
 
     log(f"Total lists: {len(current_lists)} (cap {MAX_LISTS})")
     for bucket, items in sorted(by_bucket.items()):
-        log(f"  {bucket}: {len(items)} lists")
-        for l in items[:3]:
-            log(f"    e.g. {l['name']!r} ({l['id']}, {l.get('count', '?')} items)")
+        domains = sum(i.get("count", 0) or 0 for i in items)
+        log(f"  {bucket}: {len(items)} lists, {domains} domains")
 
 
 if __name__ == "__main__":
