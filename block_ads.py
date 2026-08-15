@@ -768,13 +768,16 @@ def resolve_selection(config, substitutions=None):
 #   no early safety margin, so nothing is ever given up while the real thing
 #   still fits.
 #
-#   LEAST COMPROMISE. Every possible single downgrade is costed against the real
-#   downloaded sets, and the CHEAPEST one that fits wins -- not the biggest
-#   list. Dropping Pro to Pro Mini to save 160k domains when swapping a small
-#   list would have saved the needed 2k is a worse outcome, and this avoids it.
+#   MOST RESTRICTIVE FIRST. Candidates are ranked by the source's `tier` -- how
+#   aggressive the list is -- and the highest tier is downgraded first. This is
+#   the opposite of "give up the fewest domains", and deliberately so: an
+#   aggressive list's extra domains are its long tail, while a light list is
+#   almost entirely the common, high-traffic domains you would notice losing.
+#   Cutting Hagezi Normal to save 3k domains is a worse outcome than cutting
+#   Pro to Pro Mini, even though the Pro swap "costs" far more entries.
 #
-#   ONE AT A TIME. Only if no single swap is enough does it apply the most
-#   effective one and look again, so it never downgrades more lists than the
+#   ONE AT A TIME. Only if no single swap is enough does it apply the best
+#   candidate and look again, so it never downgrades more lists than the
 #   shortfall actually requires.
 #
 # An out-of-date but working blocklist protects the network; a failed sync
@@ -845,18 +848,23 @@ def resolve_within_capacity(config, whitelist_count):
         if not scored:
             die("Every capacity fallback failed to download. Nothing has been changed.")
 
+        # Rank: most aggressive list first, then by how much room it frees.
+        # `tier` comes from the app's catalog via blocklists.json; a source
+        # without one is treated as tier 0 so it is downgraded last.
+        rank = lambda c: (specs.get(c["sid"], {}).get("tier", 0), c["given_up"])
+
         fitting = [c for c in scored if _fits(c["total"], c["needed"])]
         if fitting:
-            # Least compromise: of the swaps that work, the one that gives up
-            # the fewest domains.
-            best = min(fitting, key=lambda c: c["given_up"])
-            log(f"CAPACITY VALVE: swapped '{specs[best['sid']].get('name', best['sid'])}' for "
-                f"'{specs[best['fb']].get('name', best['fb'])}' — the smallest change that fits "
-                f"({best['given_up']} domains given up; now {best['total']} in ~{best['needed']} lists).")
+            best = max(fitting, key=rank)
+            log(f"CAPACITY VALVE: swapped '{specs[best['sid']].get('name', best['sid'])}' "
+                f"(tier {specs.get(best['sid'], {}).get('tier', 0)}) for "
+                f"'{specs[best['fb']].get('name', best['fb'])}' — the most aggressive list that "
+                f"fixes it ({best['given_up']} domains given up; now {best['total']} in "
+                f"~{best['needed']} lists).")
             return (*best["sets"], best["subs"])
 
-        # Nothing fits alone: take the biggest reduction and reassess.
-        best = max(scored, key=lambda c: c["given_up"])
+        # Nothing fits alone: apply the highest-tier candidate and reassess.
+        best = max(scored, key=rank)
         log(f"Still over after swapping '{best['sid']}' alone; applying it "
             f"(-{best['given_up']} domains) and looking again.")
         substitutions, sets, total, needed = best["subs"], best["sets"], best["total"], best["needed"]
