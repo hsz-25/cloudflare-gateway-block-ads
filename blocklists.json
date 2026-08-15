@@ -2,12 +2,14 @@
   "networks": {
     "home": [
       "hagezi-multi",
-      "urlhaus"
+      "urlhaus",
+      "hagezi-popupads"
     ],
     "personal": [
       "hagezi-multi",
       "hagezi-pro",
-      "urlhaus"
+      "urlhaus",
+      "hagezi-popupads"
     ]
   },
   "sources": {
@@ -19,6 +21,16 @@
         "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/multi-onlydomains.txt",
         "https://hagezi-mirror.dnsbunker.org/wildcard/multi-onlydomains.txt",
         "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/multi-onlydomains.txt"
+      ]
+    },
+    "hagezi-popupads": {
+      "format": "domains",
+      "min_domains": 26144,
+      "name": "Hagezi Pop-up Ads",
+      "urls": [
+        "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/popupads-onlydomains.txt",
+        "https://hagezi-mirror.dnsbunker.org/wildcard/popupads-onlydomains.txt",
+        "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/popupads-onlydomains.txt"
       ]
     },
     "hagezi-pro": {
@@ -40,7 +52,7 @@
       ]
     }
   },
-  "updated_at": "2026-08-15T00:17:44Z",
+  "updated_at": "2026-08-15T00:19:13Z",
   "updated_by": "Zamir Residence Dashboard",
   "version": 1
 }
