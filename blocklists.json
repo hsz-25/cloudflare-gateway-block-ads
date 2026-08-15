@@ -6,7 +6,6 @@
       "hagezi-popupads"
     ],
     "personal": [
-      "hagezi-multi",
       "hagezi-pro",
       "urlhaus",
       "hagezi-popupads"
@@ -52,7 +51,7 @@
       ]
     }
   },
-  "updated_at": "2026-08-15T00:19:13Z",
+  "updated_at": "2026-08-15T00:21:05Z",
   "updated_by": "Zamir Residence Dashboard",
   "version": 1
 }
