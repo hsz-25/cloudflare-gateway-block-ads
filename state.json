@@ -1,5 +1,25 @@
 {
-  "blocklist_mode": "full_pro",
-  "delta_sha256": "eeabd772f5a42320f97d435fcdb7586e527e9fc04f66c5e77fd606a9c49a890b",
-  "normal_sha256": "20cbe79d0e18dc91d4ab025e0aeb1c351da519a114444ab41ca3ce766626f96a"
+  "domains": {
+    "home_only": 10307,
+    "personal_only": 35419,
+    "shared": 179029
+  },
+  "networks": {
+    "home": [
+      "hagezi-multi",
+      "hagezi-popupads",
+      "urlhaus"
+    ],
+    "personal": [
+      "hagezi-pro",
+      "urlhaus"
+    ]
+  },
+  "selection_sha256": "9a57885ea4d2cd83cb9d60187e8b42c9dec31d2d26a580ba4a18edcbce01faec",
+  "synced_at": "2026-08-15T01:53:25Z",
+  "tier_sha256": {
+    "Block ads - Home": "0a96e711792713a735802250a3bd7aa48237dbaf68b2b3c791d49d0b8082d55f",
+    "Block ads - Personal": "9d6c65037d1ecd1398f2094be61ac4c2063896a0df68689e31650ec3383cdf4e",
+    "Block ads - Shared": "57f50f0ff6b9e1fdc63e61d13b772978abcb755febed2409383aa51046cade61"
+  }
 }
