@@ -7,22 +7,10 @@
     ],
     "personal": [
       "hagezi-pro",
-      "urlhaus",
-      "hagezi-doh"
+      "urlhaus"
     ]
   },
   "sources": {
-    "hagezi-doh": {
-      "format": "domains",
-      "min_domains": 1,
-      "name": "Hagezi DoH Bypass",
-      "tier": 0,
-      "urls": [
-        "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/doh-onlydomains.txt",
-        "https://hagezi-mirror.dnsbunker.org/wildcard/doh-onlydomains.txt",
-        "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/doh-onlydomains.txt"
-      ]
-    },
     "hagezi-light": {
       "format": "domains",
       "min_domains": 20328,
@@ -90,7 +78,7 @@
       ]
     }
   },
-  "updated_at": "2026-08-15T03:56:23Z",
+  "updated_at": "2026-08-17T19:56:16Z",
   "updated_by": "Zamir Residence Dashboard",
   "version": 1
 }
