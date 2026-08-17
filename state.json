@@ -1,9 +1,9 @@
 {
   "capacity_blockers": [],
   "domains": {
-    "home_only": 10357,
-    "personal_only": 39821,
-    "shared": 181726
+    "home_only": 10354,
+    "personal_only": 36522,
+    "shared": 181725
   },
   "downgraded": [],
   "networks": {
@@ -14,15 +14,14 @@
     ],
     "personal": [
       "hagezi-pro",
-      "urlhaus",
-      "hagezi-doh"
+      "urlhaus"
     ]
   },
-  "selection_sha256": "608b34be2d0fbf16f9021f9b1014cb230bdbb9f4572a6bf7586fd1834140cc55",
-  "synced_at": "2026-08-17T13:05:32Z",
+  "selection_sha256": "9a57885ea4d2cd83cb9d60187e8b42c9dec31d2d26a580ba4a18edcbce01faec",
+  "synced_at": "2026-08-17T20:01:41Z",
   "tier_sha256": {
-    "Block ads - Home": "57b9233b4bdcd204078c8503f16d3ab4344e9a39bfd128a626949514bf20e28a",
-    "Block ads - Personal": "9c144f3e1bdd0c8762f61a77f43070dbe9580608423c703def4af6e7177455d5",
-    "Block ads - Shared": "c4dfb3927e84282ef18c1cec7bc5b986d424293d6179e17bf0de47ea611b3e94"
+    "Block ads - Home": "9d648987f0cfc0156c715094e2d5e73211df9cf7d8f4b3d2994827eb936c3ffe",
+    "Block ads - Personal": "195e6fbddddb217aa33c0284f05ae1cd624981b50667f7a4388ff310256b010f",
+    "Block ads - Shared": "fed811aab33286f66d99f1e18e9e8a41d6e424cdbb4887ab6027636bd75eb1fb"
   }
 }
