@@ -18,10 +18,10 @@
     ]
   },
   "selection_sha256": "9a57885ea4d2cd83cb9d60187e8b42c9dec31d2d26a580ba4a18edcbce01faec",
-  "synced_at": "2026-08-30T13:04:33Z",
+  "synced_at": "2026-08-30T23:03:57Z",
   "tier_sha256": {
     "Block ads - Home": "80b7fe279caab37866bc4a13bb039b52401c7daeaa97f15ca813202d2d60ee99",
-    "Block ads - Personal": "0f19658f308855a41e6a235787914a8002054d89306001114c98607a78a2bca0",
-    "Block ads - Shared": "61d84e08c6983e6acda1394b3c6503a02598c76c3a5b412aa1d501058fde3f2c"
+    "Block ads - Personal": "5e93b658b707d78b71800a917c02c25011fd2c2be96822d1735d6768c59dd35a",
+    "Block ads - Shared": "48cf2e7db4f38068fed43dbde9a86d8e1195ef4610826861f7c92f519bc4802d"
   }
 }
