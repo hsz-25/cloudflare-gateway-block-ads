@@ -586,6 +586,12 @@ def compact_lists(prefix, current_map):
     return len(drained)
 
 
+def trailing_number(name):
+    """The NNN in "<anything> - NNN", or 0 for a name without one."""
+    m = re.search(r" - (\d+)$", name)
+    return int(m.group(1)) if m else 0
+
+
 def sync_list_set(prefix, target_domains, existing_lists, budget):
     """Diff/PATCH a tier's Lists so their combined contents equal target_domains,
     creating new Lists only for overflow that doesn't fit in existing ones.
@@ -636,7 +642,15 @@ def sync_list_set(prefix, target_domains, existing_lists, budget):
 
     final_ids = [lst["id"] for lst in existing_lists]
     lists_created = 0
-    next_n = len(existing_lists) + 1
+    # Number new lists past the highest number the tier already uses, not past
+    # its *count*. The two differ whenever the numbering has gaps or the tier
+    # spans two name variants: the original Hagezi run baked a timestamp into
+    # its names, and migrate_prefixes() kept it, so this account holds both
+    # "Block ads - Shared 1783926121 - 001..156" and "Block ads - Shared -
+    # 162..190". count + 1 = 186 already existed, and Cloudflare answered every
+    # POST /gateway/lists with HTTP 409 — which failed the sync each run from
+    # Sep 13, 2026, the first day the target outgrew 185 full lists.
+    next_n = 1 + max((trailing_number(lst["name"]) for lst in existing_lists), default=0)
     new_lists_needed = (len(add_queue) + CHUNK_SIZE - 1) // CHUNK_SIZE
     if new_lists_needed > budget:
         die(f"[{prefix}] needs {new_lists_needed} new lists but only {budget} remain within the "
