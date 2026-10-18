@@ -3,7 +3,7 @@
   "domains": {
     "home_only": 13544,
     "personal_only": 29668,
-    "shared": 173004
+    "shared": 173007
   },
   "downgraded": [],
   "networks": {
@@ -18,10 +18,10 @@
     ]
   },
   "selection_sha256": "9a57885ea4d2cd83cb9d60187e8b42c9dec31d2d26a580ba4a18edcbce01faec",
-  "synced_at": "2026-10-18T13:04:08Z",
+  "synced_at": "2026-10-18T23:03:34Z",
   "tier_sha256": {
     "Block ads - Home": "c1ed481840de2f0289f99e3472f43eae04dae568020a6f664989ddfd411da998",
     "Block ads - Personal": "f543b20d3119eeb17f0f93c36dd309afc1e0cd754538224e9c371dc9ae3031a2",
-    "Block ads - Shared": "82f23b315841ca3fd6f9477009556da3108a9ed2b38caead8daf59400210a751"
+    "Block ads - Shared": "a9880d1c3310f847a837ae54485669a19c0b6b8629a891b1505a0fa1e44e673a"
   }
 }
