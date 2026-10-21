@@ -2,12 +2,10 @@
   "networks": {
     "home": [
       "hagezi-multi",
-      "hagezi-popupads",
-      "urlhaus"
+      "hagezi-popupads"
     ],
     "personal": [
-      "hagezi-pro",
-      "urlhaus"
+      "hagezi-pro"
     ]
   },
   "sources": {
@@ -67,18 +65,9 @@
         "https://hagezi-mirror.dnsbunker.org/wildcard/pro.mini-onlydomains.txt",
         "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/pro.mini-onlydomains.txt"
       ]
-    },
-    "urlhaus": {
-      "format": "hosts",
-      "min_domains": 1,
-      "name": "URLhaus",
-      "tier": 1,
-      "urls": [
-        "https://urlhaus.abuse.ch/downloads/hostfile/"
-      ]
     }
   },
-  "updated_at": "2026-08-17T19:56:16Z",
+  "updated_at": "2026-10-21T23:45:16Z",
   "updated_by": "Zamir Residence Dashboard",
   "version": 1
 }
