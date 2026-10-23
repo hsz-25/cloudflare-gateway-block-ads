@@ -1,9 +1,9 @@
 {
   "capacity_blockers": [],
   "domains": {
-    "home_only": 13765,
-    "personal_only": 29990,
-    "shared": 177517
+    "home_only": 13844,
+    "personal_only": 30008,
+    "shared": 178781
   },
   "downgraded": [],
   "networks": {
@@ -16,10 +16,10 @@
     ]
   },
   "selection_sha256": "7948a40b68caf6eb2d583a08818c780dea71665e5c73072d4c5fbe223433e661",
-  "synced_at": "2026-10-22T13:07:56Z",
+  "synced_at": "2026-10-23T13:06:31Z",
   "tier_sha256": {
-    "Block ads - Home": "30a113382fffc18e4d731db3f343ac178e2a772738fbba63b76a1af000ed28cc",
-    "Block ads - Personal": "bd2272567503b7fa59c96f4a36af36302c06459226665974df27801e3146d19d",
-    "Block ads - Shared": "541bcaa63032293c4a2988942282703841142d06c195b0f136386d832bdb73fb"
+    "Block ads - Home": "7a1e8f1b3127723c626cfb4918a427e6c6e33a95ef46ad3aa0cf3cc4ba9e8ebe",
+    "Block ads - Personal": "639c3fb97ba8da874a1799fb8100612e8c45b4086843b176cd278c09d00a3b9a",
+    "Block ads - Shared": "8af31b7cef7358b0e1807906679cdcc917c2ebf2189371c84574ce238124013e"
   }
 }
